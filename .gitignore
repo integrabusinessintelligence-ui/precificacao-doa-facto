@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+.ipynb_checkpoints/
+
+.DS_Store
+Thumbs.db
+
+dados/projetos.xlsx
+dados/parf_itens.xlsx
+dados/icp_giro.xlsx
+dados/doa_resultados.xlsx

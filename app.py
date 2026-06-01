@@ -245,26 +245,18 @@ def carregar_projetos():
 def carregar_parf():
     df = carregar_excel(ARQ_PARF, colunas_parf())
 
-    # Garante colunas flexíveis
-    for col in df.columns:
-        df[col] = df[col].astype("object")
-
-    df = df.where(pd.notnull(df), "")
-
-    if not df.empty:
-        mascara_sem_id = (
-            df["id_item"].isna()
-            | (df["id_item"].astype(str).str.strip() == "")
-            | (df["id_item"].astype(str).str.lower() == "nan")
-        )
-
-        if mascara_sem_id.any():
-            df.loc[mascara_sem_id, "id_item"] = [
-                gerar_id() for _ in range(mascara_sem_id.sum())
-            ]
+    # Compatibilidade com arquivos antigos sem id_item
+    if "id_item" not in df.columns:
+        df.insert(0, "id_item", [gerar_id() for _ in range(len(df))])
+        if not df.empty:
             salvar_excel(df, ARQ_PARF)
 
-    return df
+    # Garante todas as colunas esperadas
+    for coluna in colunas_parf():
+        if coluna not in df.columns:
+            df[coluna] = None
+
+    return df[colunas_parf()]
 
 
 def carregar_icp_giro():
@@ -283,7 +275,6 @@ def calcular_prazo_meses(inicio, fim):
 
 
 def carregar_auxiliares():
-    """Carrega a planilha auxiliares.xlsx, padronizando nomes de abas e colunas."""
     aux = {}
 
     if not ARQ_AUXILIARES.exists():
@@ -293,8 +284,10 @@ def carregar_auxiliares():
         xls = pd.ExcelFile(ARQ_AUXILIARES)
         for aba in xls.sheet_names:
             df = pd.read_excel(ARQ_AUXILIARES, sheet_name=aba)
-            df.columns = df.columns.astype(str).str.strip()
-            aux[aba.strip()] = df
+            chave_original = str(aba)
+            chave_limpa = chave_original.strip()
+            aux[chave_original] = df
+            aux[chave_limpa] = df
     except Exception:
         pass
 
@@ -341,74 +334,320 @@ def limpar_lista(valores):
     return lista
 
 
-def obter_opcoes_bolsas(aux):
-    df = aux.get("CLASSIFICAÇÃO DE BOLSAS", pd.DataFrame()).copy()
-    if df.empty:
+
+def _nome_aba_por_prefixo(prefixo):
+    """Localiza uma aba no arquivo auxiliares.xlsx por prefixo, ignorando espaços."""
+    if not ARQ_AUXILIARES.exists():
+        return None
+    try:
+        xls = pd.ExcelFile(ARQ_AUXILIARES)
+        alvo = str(prefixo).strip().upper()
+        for aba in xls.sheet_names:
+            if str(aba).strip().upper().startswith(alvo):
+                return aba
+    except Exception:
+        return None
+    return None
+
+
+def limpar_lista(valores):
+    lista = []
+    for v in valores:
+        if pd.isna(v):
+            continue
+        texto = str(v).strip()
+        if not texto or texto.lower() in ["nan", "none"]:
+            continue
+        if texto.upper() in [
+            "MODALIDADE",
+            "CATEGORIA",
+            "SUBELEMENTOS DE DESPESA",
+            "EQUIPAMENTOS E MATERIAIS PERMANENTES",
+            "MATERIAL DE CONSUMO",
+            "SERVIÇOS DE TERCEIROS",
+            "SERVICOS DE TERCEIROS",
+            "TIPO DE DESPESA",
+            "TIPO DE PASSAGENS",
+        ]:
+            continue
+        lista.append(texto)
+    return sorted(list(dict.fromkeys(lista)))
+
+
+def _normalizar_coluna_nome(coluna):
+    texto = str(coluna or "").strip().lower()
+    troca = {
+        "á":"a", "à":"a", "ã":"a", "â":"a",
+        "é":"e", "ê":"e",
+        "í":"i",
+        "ó":"o", "ô":"o", "õ":"o",
+        "ú":"u",
+        "ç":"c",
+    }
+    for origem, destino in troca.items():
+        texto = texto.replace(origem, destino)
+    texto = texto.replace(" ", "_").replace("-", "_")
+    while "__" in texto:
+        texto = texto.replace("__", "_")
+    return texto.strip("_")
+
+
+def _ler_aba_normalizada(nome_aba):
+    if not ARQ_AUXILIARES.exists():
+        return pd.DataFrame()
+    try:
+        xls = pd.ExcelFile(ARQ_AUXILIARES)
+        mapa = {str(aba).strip().casefold(): aba for aba in xls.sheet_names}
+        aba_real = mapa.get(str(nome_aba).strip().casefold())
+        if not aba_real:
+            return pd.DataFrame()
+        df = pd.read_excel(ARQ_AUXILIARES, sheet_name=aba_real)
+        df.columns = [_normalizar_coluna_nome(c) for c in df.columns]
         return df
-    df.columns = df.columns.astype(str).str.strip()
-    return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def obter_opcoes_bolsas(aux=None):
+    """Lê preferencialmente a aba normalizada aux_bolsas.
+
+    Esperado:
+    - modalidade
+    - categoria
+    - valor_referencia (opcional)
+
+    Mantém fallback para a aba antiga CLASSIFICAÇÃO DE BOLSAS.
+    """
+    df_norm = _ler_aba_normalizada("aux_bolsas")
+    if not df_norm.empty and {"modalidade", "categoria"}.issubset(set(df_norm.columns)):
+        col_valor = None
+        for possivel in ["valor_referencia", "valor", "valor_unitario", "valor_bolsa"]:
+            if possivel in df_norm.columns:
+                col_valor = possivel
+                break
+
+        dados = pd.DataFrame({
+            "Modalidade": df_norm["modalidade"],
+            "Categoria": df_norm["categoria"],
+            "Valor": df_norm[col_valor] if col_valor else 0,
+        })
+
+        dados["Modalidade"] = dados["Modalidade"].astype(str).str.strip()
+        dados["Categoria"] = dados["Categoria"].astype(str).str.strip()
+        dados["Valor"] = pd.to_numeric(dados["Valor"], errors="coerce").fillna(0)
+        dados = dados[
+            ~dados["Modalidade"].str.lower().isin(["nan", "none", ""])
+            & ~dados["Categoria"].str.lower().isin(["nan", "none", ""])
+        ].copy()
+        return dados.drop_duplicates().reset_index(drop=True)
+
+    # Fallback: estrutura visual antiga.
+    aba = _nome_aba_por_prefixo("CLASSIFICAÇÃO DE BOLSAS")
+    if not aba:
+        return pd.DataFrame(columns=["Modalidade", "Categoria", "Valor"])
+
+    try:
+        raw = pd.read_excel(ARQ_AUXILIARES, sheet_name=aba, header=None)
+    except Exception:
+        return pd.DataFrame(columns=["Modalidade", "Categoria", "Valor"])
+
+    if raw.empty or raw.shape[1] < 3:
+        return pd.DataFrame(columns=["Modalidade", "Categoria", "Valor"])
+
+    header = raw.iloc[0].astype(str).str.replace("\xa0", " ", regex=False).str.strip().tolist()
+    col_modalidade = 0
+    col_categoria = 2
+    col_valor = None
+
+    for i, h in enumerate(header):
+        h_norm = h.lower()
+        if "valor" in h_norm:
+            col_valor = i
+            break
+
+    if col_valor is None and raw.shape[1] >= 9:
+        col_valor = 8
+
+    dados = pd.DataFrame({
+        "Modalidade": raw.iloc[1:, col_modalidade],
+        "Categoria": raw.iloc[1:, col_categoria],
+        "Valor": raw.iloc[1:, col_valor] if col_valor is not None and col_valor < raw.shape[1] else 0
+    })
+
+    dados["Modalidade"] = dados["Modalidade"].astype(str).str.strip()
+    dados["Categoria"] = dados["Categoria"].astype(str).str.strip()
+    dados["Valor"] = pd.to_numeric(dados["Valor"], errors="coerce").fillna(0)
+    dados = dados[
+        ~dados["Modalidade"].str.lower().isin(["nan", "none", ""])
+        & ~dados["Categoria"].str.lower().isin(["nan", "none", ""])
+    ].copy()
+    return dados.drop_duplicates().reset_index(drop=True)
 
 
 def obter_valor_bolsa(df_bolsas, modalidade, categoria):
-    if df_bolsas.empty or "Valor\xa0R$" not in df_bolsas.columns:
+    if df_bolsas.empty:
         return 0.0
 
-    filtro = pd.Series([True] * len(df_bolsas))
-    if "Modalidade" in df_bolsas.columns:
-        filtro = filtro & (df_bolsas["Modalidade"].astype(str) == str(modalidade))
-    if "Categoria" in df_bolsas.columns:
-        filtro = filtro & (df_bolsas["Categoria"].astype(str) == str(categoria))
+    df = df_bolsas.copy()
+    filtro = (
+        df["Modalidade"].astype(str).str.strip().str.casefold() == str(modalidade).strip().casefold()
+    ) & (
+        df["Categoria"].astype(str).str.strip().str.casefold() == str(categoria).strip().casefold()
+    )
 
-    valores = pd.to_numeric(df_bolsas.loc[filtro, "Valor\xa0R$"], errors="coerce").dropna()
+    valores = pd.to_numeric(df.loc[filtro, "Valor"], errors="coerce").dropna()
     if valores.empty:
         return 0.0
     return float(valores.iloc[0])
 
 
 def obter_lista_despesas(aux, grupo):
-    df = aux.get("CLASSIFICAÇÃO DE DESPESAS", pd.DataFrame()).copy()
-    if df.empty:
+    """Lê preferencialmente a aba normalizada aux_despesas.
+
+    Esperado:
+    - grupo_parf
+    - categoria
+
+    Mantém fallback para a aba antiga CLASSIFICAÇÃO DE DESPESAS.
+    """
+    df_norm = _ler_aba_normalizada("aux_despesas")
+    if not df_norm.empty and {"grupo_parf", "categoria"}.issubset(set(df_norm.columns)):
+        temp = df_norm.copy()
+        temp["grupo_norm"] = temp["grupo_parf"].astype(str).str.strip().str.casefold()
+        grupo_norm = str(grupo).strip().casefold()
+        valores = temp.loc[temp["grupo_norm"] == grupo_norm, "categoria"].tolist()
+        return limpar_lista(valores)
+
+    # Fallback: estrutura visual antiga.
+    aba = _nome_aba_por_prefixo("CLASSIFICAÇÃO DE DESPESAS")
+    if not aba:
         return []
 
-    # Estrutura da planilha: col. 1 permanente, col. 2 consumo, col. 3 serviço PJ.
-    mapa_colunas = {
-        "Material permanente": 1,
-        "Material de consumo": 2,
-        "Serviço PJ": 3,
+    try:
+        raw = pd.read_excel(ARQ_AUXILIARES, sheet_name=aba, header=None)
+    except Exception:
+        return []
+
+    if raw.empty:
+        return []
+
+    raw = raw.dropna(axis=1, how="all")
+    if raw.empty:
+        return []
+
+    linha_header = None
+    for i in range(raw.shape[0]):
+        linha = " | ".join([str(x).strip().upper() for x in raw.iloc[i].tolist() if pd.notna(x)])
+        if "EQUIPAMENTOS" in linha and "MATERIAL DE CONSUMO" in linha:
+            linha_header = i
+            break
+
+    if linha_header is None:
+        linha_header = 0
+
+    mapa_posicao = {
+        "Material permanente": 0,
+        "Material de consumo": 1,
+        "Serviço PJ": 2,
     }
 
-    pos = mapa_colunas.get(grupo)
-    if pos is None or pos >= len(df.columns):
+    pos = mapa_posicao.get(grupo)
+    if pos is None or pos >= raw.shape[1]:
         return []
 
-    return limpar_lista(df.iloc[:, pos].tolist())
+    valores = raw.iloc[linha_header + 1:, pos].tolist()
+    return limpar_lista(valores)
 
 
 def obter_lista_diarias(aux):
-    df = aux.get("CLASSIFICAÇÃO E VALORES DE DIÁR", pd.DataFrame()).copy()
-    if df.empty or len(df.columns) < 3:
+    """Lê preferencialmente a aba normalizada aux_diarias.
+
+    Esperado:
+    - tipo_diaria
+    - valor_unitario
+    """
+    df_norm = _ler_aba_normalizada("aux_diarias")
+    if not df_norm.empty and "tipo_diaria" in df_norm.columns:
+        col_valor = "valor_unitario" if "valor_unitario" in df_norm.columns else ("valor" if "valor" in df_norm.columns else None)
+        dados = pd.DataFrame({
+            "tipo": df_norm["tipo_diaria"],
+            "valor": df_norm[col_valor] if col_valor else 0,
+        })
+        dados["tipo"] = dados["tipo"].astype(str).str.strip()
+        dados["valor"] = pd.to_numeric(dados["valor"], errors="coerce").fillna(0)
+        dados = dados[~dados["tipo"].str.lower().isin(["nan", "none", ""])].copy()
+        return dados.drop_duplicates().reset_index(drop=True)
+
+    # Fallback: estrutura visual antiga.
+    aba = _nome_aba_por_prefixo("CLASSIFICAÇÃO E VALORES DE DIÁR")
+    if not aba:
         return pd.DataFrame(columns=["tipo", "valor"])
 
-    base = pd.DataFrame({
-        "tipo": df.iloc[:, 1],
-        "valor": pd.to_numeric(df.iloc[:, 2], errors="coerce")
-    })
-    base = base.dropna(subset=["tipo", "valor"])
-    base["tipo"] = base["tipo"].astype(str).str.strip()
-    return base
+    try:
+        raw = pd.read_excel(ARQ_AUXILIARES, sheet_name=aba, header=None)
+    except Exception:
+        return pd.DataFrame(columns=["tipo", "valor"])
+
+    if raw.empty:
+        return pd.DataFrame(columns=["tipo", "valor"])
+
+    raw = raw.dropna(axis=1, how="all")
+    if raw.shape[1] < 2:
+        return pd.DataFrame(columns=["tipo", "valor"])
+
+    linha_header = None
+    for i in range(raw.shape[0]):
+        vals = [str(x).strip().upper() for x in raw.iloc[i].tolist() if pd.notna(x)]
+        if any("TIPO" in v for v in vals):
+            linha_header = i
+            break
+
+    if linha_header is None:
+        linha_header = 0
+
+    linhas = []
+    for i in range(linha_header + 1, raw.shape[0]):
+        tipo = raw.iat[i, 0]
+        valor = raw.iat[i, 1]
+        valor_num = pd.to_numeric(valor, errors="coerce")
+        if pd.isna(tipo) or pd.isna(valor_num):
+            continue
+        tipo_txt = str(tipo).strip()
+        if not tipo_txt or tipo_txt.lower() in ["nan", "none"]:
+            continue
+        if "COTAÇÃO" in tipo_txt.upper() or "DÓLAR" in tipo_txt.upper():
+            continue
+        linhas.append({"tipo": tipo_txt, "valor": float(valor_num)})
+
+    return pd.DataFrame(linhas).drop_duplicates().reset_index(drop=True)
 
 
 def obter_lista_passagens(aux):
-    df = aux.get("CLASSIFICAÇÃO PASSAGENS", pd.DataFrame()).copy()
-    if df.empty:
-        # Tolerância para aba com espaço final no nome, caso venha sem strip em algum ambiente.
-        df = aux.get("CLASSIFICAÇÃO PASSAGENS ", pd.DataFrame()).copy()
+    """Lê preferencialmente a aba normalizada aux_passagens.
 
-    if df.empty:
+    Esperado:
+    - tipo_passagem
+    """
+    df_norm = _ler_aba_normalizada("aux_passagens")
+    if not df_norm.empty and "tipo_passagem" in df_norm.columns:
+        return limpar_lista(df_norm["tipo_passagem"].tolist())
+
+    aba = _nome_aba_por_prefixo("CLASSIFICAÇÃO PASSAGENS")
+    if not aba:
         return []
 
-    primeira_coluna = df.columns[0]
-    return limpar_lista(df[primeira_coluna].tolist())
+    try:
+        raw = pd.read_excel(ARQ_AUXILIARES, sheet_name=aba, header=None)
+    except Exception:
+        return []
+
+    raw = raw.dropna(axis=1, how="all")
+    if raw.empty:
+        return []
+
+    valores = raw.iloc[:, 0].tolist()
+    return limpar_lista(valores)
+
 
 def salvar_ou_atualizar_projeto(dados):
     df = carregar_projetos()
@@ -490,28 +729,22 @@ def mostrar_card_proposta():
 def atualizar_item_parf(id_item, dados_atualizados):
     df = carregar_parf()
 
-    # Garante colunas como tipo flexível para aceitar texto, número e vazio
-    for col in df.columns:
-        df[col] = df[col].astype("object")
-
-    # Troca NaN por vazio
-    df = df.where(pd.notnull(df), "")
+    if df.empty or "id_item" not in df.columns:
+        return False
 
     filtro = df["id_item"].astype(str) == str(id_item)
 
-    if filtro.any():
-        idx = df.index[filtro][0]
+    if not filtro.any():
+        return False
 
-        for k, v in dados_atualizados.items():
-            if k in df.columns:
-                if pd.isna(v):
-                    v = ""
-                df.at[idx, k] = v
+    idx = df.index[filtro][0]
 
-        salvar_excel(df, ARQ_PARF)
-        return True
+    for k, v in dados_atualizados.items():
+        if k in df.columns:
+            df.at[idx, k] = v
 
-    return False
+    salvar_excel(df, ARQ_PARF)
+    return True
 
 
 def excluir_item_parf(id_item):
@@ -678,6 +911,67 @@ def obter_fatores_complexidade():
 
     return fator_icp, fator_giro, fator_complexidade, float(media_icp), float(media_giro)
 
+
+
+
+def carregar_explicacoes_indicadores():
+    bases = carregar_custos_indicadores()
+    return {
+        "ICP": bases.get("ICP", pd.DataFrame()).copy(),
+        "GIRO": bases.get("GIRO", pd.DataFrame()).copy(),
+    }
+
+
+def explicacao_nota_indicador(tipo, indicador, nota):
+    bases = carregar_explicacoes_indicadores()
+    df = bases.get(tipo, pd.DataFrame()).copy()
+
+    if df.empty:
+        return f"Nota {nota}: consulte a escala explicativa cadastrada."
+
+    df.columns = df.columns.astype(str).str.strip()
+    nota_num = int(nota)
+
+    if tipo == "ICP":
+        col_item = "Item" if "Item" in df.columns else df.columns[0]
+        col_nota = "Nota" if "Nota" in df.columns else df.columns[1]
+        col_desc = "Descrição" if "Descrição" in df.columns else df.columns[-1]
+        indicador_norm = normalizar_texto(indicador)
+
+        # Busca por ocorrência aproximada: ex. "Complexidade do financiador" encontra "Financiador".
+        temp = df.copy()
+        temp["_item_norm"] = temp[col_item].astype(str).apply(normalizar_texto)
+        filtro_nota = pd.to_numeric(temp[col_nota], errors="coerce") == nota_num
+        candidatos = temp[filtro_nota]
+
+        for _, row in candidatos.iterrows():
+            item_norm = row["_item_norm"]
+            if item_norm and (item_norm in indicador_norm or indicador_norm in item_norm):
+                return f"Nota {nota_num}: {row[col_desc]}"
+
+        if not candidatos.empty:
+            return f"Nota {nota_num}: {candidatos.iloc[0][col_desc]}"
+
+    if tipo == "GIRO":
+        col_item = "GIRO" if "GIRO" in df.columns else df.columns[0]
+        col_nota = "Nota" if "Nota" in df.columns else df.columns[1]
+        col_desc = "Fator" if "Fator" in df.columns else df.columns[-1]
+        indicador_norm = normalizar_texto(indicador)
+
+        temp = df.copy()
+        temp["_item_norm"] = temp[col_item].astype(str).apply(normalizar_texto)
+        filtro_nota = pd.to_numeric(temp[col_nota], errors="coerce") == nota_num
+        candidatos = temp[filtro_nota]
+
+        for _, row in candidatos.iterrows():
+            item_norm = row["_item_norm"]
+            if item_norm and (item_norm in indicador_norm or indicador_norm in item_norm):
+                return f"Nota {nota_num}: {row[col_desc]}"
+
+        if not candidatos.empty:
+            return f"Nota {nota_num}: {candidatos.iloc[0][col_desc]}"
+
+    return f"Nota {nota_num}: consulte a escala explicativa cadastrada."
 
 def calcular_custo_hora_setor(bases):
     pessoal = bases.get("custos_pessoal", pd.DataFrame()).copy()
@@ -914,6 +1208,54 @@ def inserir_tabela_apos_paragrafo(documento, paragrafo, dados, estilo="Table Gri
     return tabela
 
 
+def inserir_paragrafo_apos_paragrafo(documento, paragrafo, texto):
+    """Insere um parágrafo simples depois de outro parágrafo."""
+    novo = documento.add_paragraph(str(texto))
+    paragrafo._p.addnext(novo._p)
+    return novo
+
+
+def inserir_paragrafo_antes_paragrafo(documento, paragrafo, texto):
+    """Insere um parágrafo simples antes de outro parágrafo."""
+    novo = documento.add_paragraph(str(texto))
+    paragrafo._p.addprevious(novo._p)
+    return novo
+
+
+
+
+
+def inserir_tabela_antes_paragrafo(documento, paragrafo, dados, estilo="Table Grid"):
+    """Insere tabela antes de um parágrafo do modelo e devolve a tabela."""
+    linhas = len(dados)
+    colunas = len(dados[0]) if dados else 1
+    tabela = documento.add_table(rows=linhas, cols=colunas)
+    tabela.style = estilo
+
+    for i, linha in enumerate(dados):
+        for j, valor in enumerate(linha):
+            celula = tabela.cell(i, j)
+            celula.text = str(valor if valor is not None else "")
+            for par in celula.paragraphs:
+                for run in par.runs:
+                    if i == 0:
+                        run.bold = True
+
+    paragrafo._p.addprevious(tabela._tbl)
+    return tabela
+
+
+def localizar_proximo_paragrafo_nao_vazio(documento, paragrafo_referencia):
+    try:
+        idx = documento.paragraphs.index(paragrafo_referencia)
+    except ValueError:
+        return paragrafo_referencia
+
+    for p in documento.paragraphs[idx + 1:]:
+        if p.text.strip():
+            return p
+    return paragrafo_referencia
+
 def localizar_paragrafo_por_texto(documento, texto_busca):
     alvo = str(texto_busca).strip().lower()
     for paragrafo in documento.paragraphs:
@@ -921,6 +1263,17 @@ def localizar_paragrafo_por_texto(documento, texto_busca):
         if alvo in texto:
             return paragrafo
     return None
+
+def inserir_quadro_no_marcador(documento, marcador, titulo, dados):
+    """Substitui um marcador textual por legenda + tabela no local exato."""
+    par_marcador = localizar_paragrafo_por_texto(documento, marcador)
+    if not par_marcador:
+        return False
+
+    par_marcador.text = str(titulo)
+    inserir_tabela_apos_paragrafo(documento, par_marcador, dados)
+    return True
+
 
 
 def obter_parf_atual_df():
@@ -1007,7 +1360,7 @@ def obter_resumo_doa_proposta(df_parf_atual):
 def gerar_proposta_docx():
     try:
         from docx import Document
-    except Exception as exc:
+    except Exception:
         st.error("Biblioteca python-docx não instalada. Rode: pip install python-docx")
         return None
 
@@ -1022,70 +1375,107 @@ def gerar_proposta_docx():
 
     documento = Document(str(ARQ_MODELO_PROPOSTA))
 
-    # 2. Objeto — quadro com dados do projeto
-    par_objeto = localizar_paragrafo_por_texto(documento, "2. Objeto")
-    if par_objeto:
-        dados_projeto = [
-            ["Campo", "Informação"],
-            ["Projeto", projeto.get("nome_projeto", "")],
-            ["Coordenador", projeto.get("coordenador", "")],
-            ["E-mail do coordenador", projeto.get("email_coordenador", "")],
-            ["Instituição executora", projeto.get("instituicao_executora", "")],
-            ["Campus", projeto.get("campus", "")],
-            ["Financiador", projeto.get("financiador", "")],
-            ["Tipo de financiador", projeto.get("tipo_financiador", "")],
-            ["Tipo de instrumento", projeto.get("tipo_instrumento", "")],
-            ["Vigência", f"{projeto.get('data_inicio', '')} a {projeto.get('data_fim', '')}"],
-            ["Prazo estimado", f"{projeto.get('prazo_meses', '')} meses"],
-            ["Valor aprovado/previsto", moeda(projeto.get("valor_aprovado", 0))],
-            ["Área temática", projeto.get("area_tematica", "")],
-        ]
-        inserir_tabela_apos_paragrafo(documento, par_objeto, dados_projeto)
+    dados_projeto = [
+        ["Campo", "Informação"],
+        ["Projeto", projeto.get("nome_projeto", "")],
+        ["Coordenador", projeto.get("coordenador", "")],
+        ["E-mail do coordenador", projeto.get("email_coordenador", "")],
+        ["Instituição executora", projeto.get("instituicao_executora", "")],
+        ["Campus", projeto.get("campus", "")],
+        ["Financiador", projeto.get("financiador", "")],
+        ["Tipo de financiador", projeto.get("tipo_financiador", "")],
+        ["Tipo de instrumento", projeto.get("tipo_instrumento", "")],
+        ["Vigência", f"{projeto.get('data_inicio', '')} a {projeto.get('data_fim', '')}"],
+        ["Prazo estimado", f"{projeto.get('prazo_meses', '')} meses"],
+        ["Valor aprovado/previsto", moeda(projeto.get("valor_aprovado", 0))],
+        ["Área temática", projeto.get("area_tematica", "")],
+        ["Responsável interno Facto", projeto.get("responsavel_facto", "")],
+    ]
 
-    # 9. Serviços e Itens Executados — resumo das rubricas do PARF
-    par_servicos = localizar_paragrafo_por_texto(documento, "9. Serviços e Itens Executados")
-    if par_servicos:
-        dados_rubricas = [["Rubrica", "Quantidade", "Valor previsto"]]
-        if not resumo_parf.empty:
-            for _, row in resumo_parf.iterrows():
-                dados_rubricas.append([
-                    row.get("Rubrica", ""),
-                    f"{float(row.get('Quantidade', 0) or 0):,.0f}".replace(",", "."),
-                    moeda(row.get("Valor previsto", 0))
-                ])
+    dados_rubricas = [["Rubrica", "Quantidade", "Valor previsto"]]
+    if not resumo_parf.empty:
+        for _, row in resumo_parf.iterrows():
             dados_rubricas.append([
-                "Total",
-                "",
-                moeda(resumo_parf["Valor previsto"].sum())
+                row.get("Rubrica", ""),
+                f"{float(row.get('Quantidade', 0) or 0):,.0f}".replace(",", "."),
+                moeda(row.get("Valor previsto", 0))
             ])
-        else:
-            dados_rubricas.append(["Sem rubricas cadastradas", "", moeda(0)])
-        inserir_tabela_apos_paragrafo(documento, par_servicos, dados_rubricas)
+        dados_rubricas.append(["Total", "", moeda(resumo_parf["Valor previsto"].sum())])
+    else:
+        dados_rubricas.append(["Sem rubricas cadastradas", "", moeda(0)])
 
-    # 11. Detalhamento dos valores de DOA — tabela final da DOA
-    par_doa = localizar_paragrafo_por_texto(documento, "11. Detalhamento dos valores de DOA")
-    if par_doa:
-        dados_doa = [["Componente da DOA", "Valor calculado", "Valor final"]]
-        if not resumo_doa.empty:
-            for _, row in resumo_doa.iterrows():
-                dados_doa.append([
-                    row.get("Componente da DOA", ""),
-                    moeda(row.get("Valor calculado", 0)),
-                    moeda(row.get("Valor final", 0))
-                ])
+    dados_doa = [["Componente da DOA", "Valor calculado", "Valor final"]]
+    if not resumo_doa.empty:
+        for _, row in resumo_doa.iterrows():
             dados_doa.append([
-                "Total",
-                moeda(resumo_doa["Valor calculado"].sum()),
-                moeda(resumo_doa["Valor final"].sum())
+                row.get("Componente da DOA", ""),
+                moeda(row.get("Valor calculado", 0)),
+                moeda(row.get("Valor final", 0))
             ])
-        else:
-            dados_doa.append(["DOA ainda não calculada", moeda(0), moeda(0)])
-        inserir_tabela_apos_paragrafo(documento, par_doa, dados_doa)
+        dados_doa.append([
+            "Total",
+            moeda(resumo_doa["Valor calculado"].sum()),
+            moeda(resumo_doa["Valor final"].sum())
+        ])
+    else:
+        dados_doa.append(["DOA ainda não calculada", moeda(0), moeda(0)])
+
+    # Insere quadros exatamente onde os marcadores foram colocados no modelo.
+    # Marcadores esperados no modelo_proposta.docx:
+    # {{TABELA_DADOS_PROJETO}}
+    # {{TABELA_RESUMO_PARF}}
+    # {{TABELA_SERVICOS_ITENS}}
+    # {{TABELA_DOA}}
+
+    inseriu_dados = inserir_quadro_no_marcador(
+        documento,
+        "{{TABELA_DADOS_PROJETO}}",
+        "Quadro 1 – Dados gerais do projeto",
+        dados_projeto
+    )
+
+    inseriu_resumo = inserir_quadro_no_marcador(
+        documento,
+        "{{TABELA_RESUMO_PARF}}",
+        "Quadro 2 – Resumo das rubricas previstas no PARF",
+        dados_rubricas
+    )
+
+    inseriu_servicos = inserir_quadro_no_marcador(
+        documento,
+        "{{TABELA_SERVICOS_ITENS}}",
+        "Quadro 3 – Serviços e itens previstos para execução",
+        dados_rubricas
+    )
+
+    inseriu_doa = inserir_quadro_no_marcador(
+        documento,
+        "{{TABELA_DOA}}",
+        "Quadro 4 – Detalhamento dos valores finais da DOA",
+        dados_doa
+    )
+
+    marcadores_faltantes = []
+    if not inseriu_dados:
+        marcadores_faltantes.append("{{TABELA_DADOS_PROJETO}}")
+    if not inseriu_resumo:
+        marcadores_faltantes.append("{{TABELA_RESUMO_PARF}}")
+    if not inseriu_servicos:
+        marcadores_faltantes.append("{{TABELA_SERVICOS_ITENS}}")
+    if not inseriu_doa:
+        marcadores_faltantes.append("{{TABELA_DOA}}")
+
+    if marcadores_faltantes:
+        st.warning(
+            "Alguns marcadores não foram encontrados no modelo_proposta.docx: "
+            + ", ".join(marcadores_faltantes)
+        )
 
     nome_base = nome_seguro_arquivo(projeto.get("nome_projeto", "proposta"))
     saida = SAIDAS_DIR / f"proposta_{nome_base}_v{versao_atual}_{id_atual}.docx"
     documento.save(str(saida))
     return saida
+
 
 # =========================
 # CABEÇALHO
@@ -1374,32 +1764,34 @@ elif pagina == "2. PARF":
                         df_bolsas["Modalidade"]
                         .dropna()
                         .astype(str)
+                        .str.strip()
                         .unique()
                         .tolist()
                     )
 
                     modalidade = st.selectbox(
                         "Modalidade da bolsa",
-                        modalidades if modalidades else ["Não informado"]
+                        modalidades if modalidades else ["Não informado"],
+                        key="parf_modalidade_bolsa"
                     )
 
-                    if "Categoria" in df_bolsas.columns:
-                        categorias = sorted(
-                            df_bolsas.loc[
-                                df_bolsas["Modalidade"].astype(str) == modalidade,
-                                "Categoria"
-                            ]
-                            .dropna()
-                            .astype(str)
-                            .unique()
-                            .tolist()
-                        )
-                    else:
-                        categorias = []
+                    categorias = sorted(
+                        df_bolsas.loc[
+                            df_bolsas["Modalidade"].astype(str).str.strip().str.casefold()
+                            == str(modalidade).strip().casefold(),
+                            "Categoria"
+                        ]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .unique()
+                        .tolist()
+                    )
 
                     categoria = st.selectbox(
                         "Categoria da bolsa",
-                        categorias if categorias else ["Não informado"]
+                        categorias if categorias else ["Não informado"],
+                        key=f"parf_categoria_bolsa_{str(modalidade)}"
                     )
 
                     valor_sugerido = obter_valor_bolsa(df_bolsas, modalidade, categoria)
@@ -1408,23 +1800,25 @@ elif pagina == "2. PARF":
                     modalidade = st.text_input("Modalidade da bolsa")
                     categoria = st.text_input("Categoria da bolsa")
 
-                item = st.text_input("Item", value=categoria)
-                descricao = st.text_input("Descrição", value="Bolsa")
+                item = st.text_input("Item", value=categoria, key=f"parf_item_bolsa_{str(categoria)}")
+                descricao = st.text_input("Descrição", value="Bolsa", key="parf_desc_bolsa")
 
             elif grupo in grupos_contratacao():
                 modalidade = st.selectbox(
                     "Modalidade",
-                    [grupo]
+                    [grupo],
+                    key=f"parf_modalidade_{grupo}"
                 )
 
                 opcoes = obter_lista_despesas(aux, grupo)
                 categoria = st.selectbox(
                     "Categoria",
-                    opcoes if opcoes else ["Não informado"]
+                    opcoes if opcoes else ["Não informado"],
+                    key=f"parf_categoria_{grupo}"
                 )
 
-                item = st.text_input("Item específico")
-                descricao = st.text_input("Descrição")
+                item = st.text_input("Item específico", key=f"parf_item_{grupo}")
+                descricao = st.text_input("Descrição", key=f"parf_desc_{grupo}")
 
             elif grupo == "Diárias":
                 df_diarias = obter_lista_diarias(aux)
@@ -1432,15 +1826,19 @@ elif pagina == "2. PARF":
 
                 modalidade = st.selectbox(
                     "Tipo de diária/auxílio",
-                    opcoes if opcoes else ["Não informado"]
+                    opcoes if opcoes else ["Não informado"],
+                    key="parf_tipo_diaria"
                 )
 
                 categoria = "Diárias e auxílio financeiro para viagem"
-                item = st.text_input("Item", value=modalidade)
-                descricao = st.text_input("Descrição", value="Diária/Auxílio financeiro para viagem")
+                item = st.text_input("Item", value=modalidade, key=f"parf_item_diaria_{str(modalidade)}")
+                descricao = st.text_input("Descrição", value="Diária/Auxílio financeiro para viagem", key="parf_desc_diaria")
 
                 if not df_diarias.empty:
-                    valores = df_diarias.loc[df_diarias["tipo"] == modalidade, "valor"]
+                    valores = df_diarias.loc[
+                        df_diarias["tipo"].astype(str).str.strip().str.casefold() == str(modalidade).strip().casefold(),
+                        "valor"
+                    ]
                     if not valores.empty:
                         valor_sugerido = float(valores.iloc[0])
 
@@ -1449,12 +1847,13 @@ elif pagina == "2. PARF":
 
                 modalidade = st.selectbox(
                     "Tipo de passagem",
-                    opcoes if opcoes else ["Não informado"]
+                    opcoes if opcoes else ["Não informado"],
+                    key="parf_tipo_passagem"
                 )
 
                 categoria = "Passagens"
-                item = st.text_input("Item", value=modalidade)
-                descricao = st.text_input("Descrição", value="Passagem")
+                item = st.text_input("Item", value=modalidade, key=f"parf_item_passagem_{str(modalidade)}")
+                descricao = st.text_input("Descrição", value="Passagem", key="parf_desc_passagem")
 
             elif grupo == "Celetistas":
                 modalidade = st.selectbox(
@@ -1816,9 +2215,10 @@ elif pagina == "3. ICP e Giro":
         "Giro em gestão institucional e governança"
     ]
 
-    with st.expander("Ver escala explicativa"):
+    with st.expander("Ver escala explicativa geral"):
         for nota, texto in escala.items():
             st.write(f"**{nota}** — {texto}")
+        st.caption("Além da escala geral, passe o mouse sobre o ícone de ajuda de cada indicador para ver a explicação da nota selecionada.")
 
     registros = []
 
@@ -1827,7 +2227,11 @@ elif pagina == "3. ICP e Giro":
     for indicador in indicadores_icp:
         col1, col2 = st.columns([1, 2])
         with col1:
-            nota = st.slider(indicador, 1, 5, 3, key=f"icp_{indicador}")
+            chave = f"icp_{indicador}"
+            valor_atual = st.session_state.get(chave, 3)
+            help_texto = explicacao_nota_indicador("ICP", indicador, valor_atual)
+            nota = st.slider(indicador, 1, 5, int(valor_atual), key=chave, help=help_texto)
+            st.caption(explicacao_nota_indicador("ICP", indicador, nota))
         with col2:
             justificativa = st.text_input(f"Justificativa — {indicador}", key=f"just_icp_{indicador}")
 
@@ -1845,7 +2249,11 @@ elif pagina == "3. ICP e Giro":
     for indicador in indicadores_giro:
         col1, col2 = st.columns([1, 2])
         with col1:
-            nota = st.slider(indicador, 1, 5, 3, key=f"giro_{indicador}")
+            chave = f"giro_{indicador}"
+            valor_atual = st.session_state.get(chave, 3)
+            help_texto = explicacao_nota_indicador("GIRO", indicador, valor_atual)
+            nota = st.slider(indicador, 1, 5, int(valor_atual), key=chave, help=help_texto)
+            st.caption(explicacao_nota_indicador("GIRO", indicador, nota))
         with col2:
             justificativa = st.text_input(f"Justificativa — {indicador}", key=f"just_giro_{indicador}")
 

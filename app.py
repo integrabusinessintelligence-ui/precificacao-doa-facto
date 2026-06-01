@@ -161,6 +161,40 @@ st.markdown(
         font-weight: 800;
     }}
 
+    .facto-callout {{
+        border-left: 6px solid #D34022;
+        background: #fff5f2;
+        padding: 16px 18px;
+        border-radius: 12px;
+        margin-top: 12px;
+        color: #163246 !important;
+        font-family: inherit !important;
+        font-size: 15px;
+        line-height: 1.5;
+    }}
+
+    .facto-callout strong {{
+        color: #D34022 !important;
+        font-weight: 800;
+    }}
+
+    .facto-info-card {{
+        background: #F7F9FB;
+        border: 1px solid #DDE4EA;
+        border-radius: 14px;
+        padding: 14px 16px;
+        margin-top: 8px;
+        color: #163246 !important;
+        font-family: inherit !important;
+        font-size: 15px;
+        line-height: 1.5;
+    }}
+
+    .facto-info-card strong {{
+        color: #163246 !important;
+        font-weight: 800;
+    }}
+
     </style>
     """,
     unsafe_allow_html=True
@@ -230,7 +264,7 @@ def colunas_icp_giro():
 def colunas_doa():
     return [
         "id_projeto", "versao", "componente", "setor", "atividade",
-        "quantidade_operacional", "tempo_base_h", "horas_estimadas",
+        "quantidade_operacional", "tempo_base_h", "vigencia_meses", "horas_estimadas",
         "custo_hora_pessoal", "custo_hora_adm", "custo_hora_total",
         "fator_icp", "fator_giro", "fator_complexidade",
         "valor_calculado", "valor_ajustado",
@@ -273,6 +307,74 @@ def calcular_prazo_meses(inicio, fim):
     return max(1, (fim.year - inicio.year) * 12 + (fim.month - inicio.month) + 1)
 
 
+def parse_data_streamlit(valor, padrao=None):
+    """Converte datas salvas em texto/Excel para date, preservando cadastro ao reabrir proposta."""
+    if padrao is None:
+        padrao = date.today()
+    if valor is None or valor == "":
+        return padrao
+    try:
+        if pd.isna(valor):
+            return padrao
+    except Exception:
+        pass
+    if isinstance(valor, datetime):
+        return valor.date()
+    if isinstance(valor, date):
+        return valor
+    try:
+        convertido = pd.to_datetime(valor, errors="coerce")
+        if pd.isna(convertido):
+            return padrao
+        return convertido.date()
+    except Exception:
+        return padrao
+
+
+def selectbox_obrigatorio(label, opcoes, key=None, texto_vazio="Selecione..."):
+    opcoes_limpas = limpar_lista(opcoes)
+    valor = st.selectbox(label, [texto_vazio] + opcoes_limpas, index=0, key=key)
+    return "" if valor == texto_vazio else valor
+
+
+def obter_vigencia_projeto_atual():
+    projeto = obter_projeto_atual() or {}
+    try:
+        return max(1.0, float(projeto.get("prazo_meses", 1) or 1))
+    except Exception:
+        return 1.0
+
+
+def calcular_operacoes_bancarias_estimadas(df_parf_atual):
+    if df_parf_atual is None or df_parf_atual.empty:
+        return 0.0
+    total_ops = 0.0
+    for _, row in df_parf_atual.iterrows():
+        grupo = str(row.get("grupo", ""))
+        if grupo == "Tarifas bancárias":
+            continue
+        qtd = pd.to_numeric(row.get("quantidade", 0), errors="coerce")
+        meses = pd.to_numeric(row.get("meses", 1), errors="coerce")
+        qtd = 0.0 if pd.isna(qtd) else float(qtd)
+        meses = 1.0 if pd.isna(meses) or float(meses) <= 0 else float(meses)
+        if grupo in ["Bolsas", "Celetistas"]:
+            total_ops += qtd * meses
+        elif grupo == "RPA":
+            total_ops += qtd
+        elif grupo in ["Material de consumo", "Material permanente", "Serviço PJ", "Importação", "Diárias", "Passagens", "Ressarcimento", "Contrapartida", "Prospecção"]:
+            total_ops += max(1.0, qtd)
+    return total_ops
+
+
+def calcular_tarifas_bancarias_estimadas(df_parf_atual, vigencia_meses):
+    operacoes = calcular_operacoes_bancarias_estimadas(df_parf_atual)
+    tarifa_operacao = 2.06
+    tarifa_manutencao_mensal = 100.00
+    valor_operacoes = operacoes * tarifa_operacao
+    valor_manutencao = max(1.0, float(vigencia_meses or 1)) * tarifa_manutencao_mensal
+    total = valor_operacoes + valor_manutencao
+    return operacoes, valor_operacoes, valor_manutencao, total
+
 
 def carregar_auxiliares():
     aux = {}
@@ -305,6 +407,7 @@ def grupos_parf():
         "Importação",
         "Diárias",
         "Passagens",
+        "Tarifas bancárias",
         "Ressarcimento",
         "Contrapartida",
         "Prospecção"
@@ -489,16 +592,22 @@ def obter_valor_bolsa(df_bolsas, modalidade, categoria):
         return 0.0
 
     df = df_bolsas.copy()
+
+    df["Modalidade"] = df["Modalidade"].astype(str).str.strip()
+    df["Categoria"] = df["Categoria"].astype(str).str.strip()
+
     filtro = (
-        df["Modalidade"].astype(str).str.strip().str.casefold() == str(modalidade).strip().casefold()
+        df["Modalidade"].str.casefold() == str(modalidade).strip().casefold()
     ) & (
-        df["Categoria"].astype(str).str.strip().str.casefold() == str(categoria).strip().casefold()
+        df["Categoria"].str.casefold() == str(categoria).strip().casefold()
     )
 
-    valores = pd.to_numeric(df.loc[filtro, "Valor"], errors="coerce").dropna()
-    if valores.empty:
+    resultado = df.loc[filtro, "Valor"]
+
+    if resultado.empty:
         return 0.0
-    return float(valores.iloc[0])
+
+    return float(resultado.iloc[0] or 0)
 
 
 def obter_lista_despesas(aux, grupo):
@@ -652,20 +761,31 @@ def obter_lista_passagens(aux):
 def salvar_ou_atualizar_projeto(dados):
     df = carregar_projetos()
 
+    # Garante que todas as colunas aceitem texto, número e vazio
+    for col in df.columns:
+        df[col] = df[col].astype("object")
+
+    # Padroniza datas como texto
     for campo in ["data_inicio", "data_fim", "data_criacao", "data_atualizacao"]:
         if campo in dados and dados[campo] is not None:
             dados[campo] = str(dados[campo])
 
+    # Substitui NaN por vazio apenas nos dados recebidos
+    for k, v in list(dados.items()):
+        if pd.isna(v):
+            dados[k] = ""
+
     if not df.empty:
         filtro = (
             (df["id_projeto"].astype(str) == str(dados["id_projeto"])) &
-            (df["versao"].astype(int) == int(dados["versao"]))
+            (df["versao"].astype(str) == str(dados["versao"]))
         )
     else:
         filtro = pd.Series([], dtype=bool)
 
     if filtro.any():
         idx = df.index[filtro][0]
+
         for k, v in dados.items():
             if k in df.columns:
                 df.at[idx, k] = v
@@ -924,50 +1044,76 @@ def carregar_explicacoes_indicadores():
 
 def explicacao_nota_indicador(tipo, indicador, nota):
     bases = carregar_explicacoes_indicadores()
-    df = bases.get(tipo, pd.DataFrame()).copy()
+    df = bases.get(str(tipo).upper(), pd.DataFrame()).copy()
+
+    try:
+        nota_num = int(nota)
+    except Exception:
+        nota_num = 3
 
     if df.empty:
-        return f"Nota {nota}: consulte a escala explicativa cadastrada."
+        return f"Nota {nota_num}: consulte a escala explicativa cadastrada."
 
     df.columns = df.columns.astype(str).str.strip()
-    nota_num = int(nota)
+    indicador_txt = normalizar_texto(indicador)
 
-    if tipo == "ICP":
+    if str(tipo).upper() == "ICP":
         col_item = "Item" if "Item" in df.columns else df.columns[0]
         col_nota = "Nota" if "Nota" in df.columns else df.columns[1]
         col_desc = "Descrição" if "Descrição" in df.columns else df.columns[-1]
-        indicador_norm = normalizar_texto(indicador)
 
-        # Busca por ocorrência aproximada: ex. "Complexidade do financiador" encontra "Financiador".
+        mapa_icp = {
+            "financiador": "Financiador",
+            "maturidade": "Planejamento",
+            "planejamento": "Planejamento",
+            "valor": "Valor Global do Projeto",
+            "executor": "Executor",
+            "início": "Prazo para Início",
+            "inicio": "Prazo para Início",
+            "coordenador com a facto": "Experiência do Coordenador com a Facto",
+            "coordenador": "Experiência do Coordenador",
+            "articulação": "RCI",
+            "articulacao": "RCI",
+            "sensibilidade": "RCI",
+            "reputacional": "RCI",
+            "normativa": "Planejamento",
+            "jurídica": "Planejamento",
+            "juridica": "Planejamento",
+            "acompanhamento": "Executor",
+            "risco": "Executor",
+            "técnico": "Experiência do Coordenador",
+            "tecnico": "Experiência do Coordenador",
+        }
+        item_alvo = None
+        for chave, item in mapa_icp.items():
+            if chave in indicador_txt:
+                item_alvo = item
+                break
+
         temp = df.copy()
-        temp["_item_norm"] = temp[col_item].astype(str).apply(normalizar_texto)
-        filtro_nota = pd.to_numeric(temp[col_nota], errors="coerce") == nota_num
-        candidatos = temp[filtro_nota]
-
-        for _, row in candidatos.iterrows():
-            item_norm = row["_item_norm"]
-            if item_norm and (item_norm in indicador_norm or indicador_norm in item_norm):
-                return f"Nota {nota_num}: {row[col_desc]}"
-
+        temp[col_nota] = pd.to_numeric(temp[col_nota], errors="coerce")
+        candidatos = temp[temp[col_nota] == nota_num]
+        if item_alvo:
+            candidatos_item = candidatos[candidatos[col_item].astype(str).str.strip().str.casefold() == item_alvo.casefold()]
+            if not candidatos_item.empty:
+                return f"Nota {nota_num}: {candidatos_item.iloc[0][col_desc]}"
         if not candidatos.empty:
             return f"Nota {nota_num}: {candidatos.iloc[0][col_desc]}"
 
-    if tipo == "GIRO":
+    if str(tipo).upper() == "GIRO":
         col_item = "GIRO" if "GIRO" in df.columns else df.columns[0]
         col_nota = "Nota" if "Nota" in df.columns else df.columns[1]
         col_desc = "Fator" if "Fator" in df.columns else df.columns[-1]
-        indicador_norm = normalizar_texto(indicador)
-
         temp = df.copy()
-        temp["_item_norm"] = temp[col_item].astype(str).apply(normalizar_texto)
-        filtro_nota = pd.to_numeric(temp[col_nota], errors="coerce") == nota_num
-        candidatos = temp[filtro_nota]
-
+        temp[col_nota] = pd.to_numeric(temp[col_nota], errors="coerce")
+        candidatos = temp[temp[col_nota] == nota_num]
+        candidatos_exato = candidatos[candidatos[col_item].astype(str).str.strip().str.casefold() == str(indicador).strip().casefold()]
+        if not candidatos_exato.empty:
+            return f"Nota {nota_num}: {candidatos_exato.iloc[0][col_desc]}"
         for _, row in candidatos.iterrows():
-            item_norm = row["_item_norm"]
-            if item_norm and (item_norm in indicador_norm or indicador_norm in item_norm):
+            item_norm = normalizar_texto(row[col_item])
+            if item_norm and (item_norm in indicador_txt or indicador_txt in item_norm):
                 return f"Nota {nota_num}: {row[col_desc]}"
-
         if not candidatos.empty:
             return f"Nota {nota_num}: {candidatos.iloc[0][col_desc]}"
 
@@ -1008,7 +1154,7 @@ def calcular_custo_hora_setor(bases):
     return setor[["setor", "custo_hora_pessoal", "custo_hora_adm", "custo_hora_total"]]
 
 
-def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, fator_icp, fator_giro, fator_complexidade, componente_forcado=None):
+def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, fator_icp, fator_giro, fator_complexidade, componente_forcado=None, vigencia_meses=None):
     if quantidade is None:
         quantidade = 0
     try:
@@ -1022,9 +1168,20 @@ def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, 
     if not info:
         return
 
+    if vigencia_meses is None:
+        try:
+            projeto_atual = obter_projeto_atual() or {}
+            vigencia_meses = float(projeto_atual.get("prazo_meses", 1) or 1)
+        except Exception:
+            vigencia_meses = 1
+    try:
+        vigencia_meses = max(1.0, float(vigencia_meses or 1))
+    except Exception:
+        vigencia_meses = 1.0
+
     setor = info.get("setor")
     tempo_base = float(info.get("tempo_base_h") or 0)
-    horas_estimadas = quantidade * tempo_base
+    horas_estimadas = quantidade * tempo_base * vigencia_meses
 
     custo_setor = custo_hora_df[custo_hora_df["setor"].astype(str) == str(setor)]
 
@@ -1045,6 +1202,7 @@ def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, 
         "atividade": info.get("atividade"),
         "quantidade_operacional": quantidade,
         "tempo_base_h": tempo_base,
+        "vigencia_meses": vigencia_meses,
         "horas_estimadas": horas_estimadas,
         "custo_hora_pessoal": custo_hora_pessoal,
         "custo_hora_adm": custo_hora_adm,
@@ -1119,6 +1277,9 @@ def gerar_memoria_doa(df_parf_atual, bases):
             quantidade_operacional = qtd * meses
             adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Diárias (Projetos)", quantidade_operacional, fator_icp, fator_giro, fator_complexidade)
             adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de diária", quantidade_operacional, fator_icp, fator_giro, fator_complexidade)
+
+        elif grupo == "Tarifas bancárias":
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Conciliação bancária", 1, fator_icp, fator_giro, fator_complexidade)
 
         elif grupo in ["Ressarcimento", "Contrapartida"]:
             adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gerenciamento orçamentário e financeiro (Projetos)", 1, fator_icp, fator_giro, fator_complexidade)
@@ -1640,8 +1801,14 @@ if pagina == "1. Cadastro do Projeto":
             )
 
         with col2:
-            data_inicio = st.date_input("Data de início", value=date.today())
-            data_fim = st.date_input("Data de fim", value=date.today())
+            data_inicio = st.date_input(
+                "Data de início",
+                value=parse_data_streamlit(projeto.get("data_inicio"), date.today())
+            )
+            data_fim = st.date_input(
+                "Data de fim",
+                value=parse_data_streamlit(projeto.get("data_fim"), date.today())
+            )
             prazo_meses = calcular_prazo_meses(data_inicio, data_fim)
 
             st.info(f"Prazo estimado: {prazo_meses} meses")
@@ -1735,12 +1902,21 @@ elif pagina == "2. PARF":
     aux = carregar_auxiliares()
     df_parf = carregar_parf()
 
-    st.info("Nesta primeira versão, os itens são salvos em formato de tabela. Depois refinamos a tela por blocos.")
+    if "parf_form_seq" not in st.session_state:
+        st.session_state["parf_form_seq"] = 0
+
+    form_seq = st.session_state["parf_form_seq"]
 
     grupo = st.selectbox(
         "Grupo de rubrica",
-        grupos_parf()
+        ["Selecione a rubrica..."] + grupos_parf(),
+        index=0,
+        key=f"parf_grupo_{form_seq}"
     )
+
+    if grupo == "Selecione a rubrica...":
+        st.info("Selecione uma rubrica para iniciar o preenchimento.")
+        st.stop()
 
     modalidade = ""
     categoria = ""
@@ -1750,7 +1926,7 @@ elif pagina == "2. PARF":
     valor_adicional = 0.0
     modalidade_contratacao = ""
 
-    with st.form("form_parf_item"):
+    with st.form(f"form_parf_item_{form_seq}"):
         col1, col2, col3 = st.columns(3)
 
         with col1:
@@ -1759,82 +1935,79 @@ elif pagina == "2. PARF":
             if grupo == "Bolsas":
                 df_bolsas = obter_opcoes_bolsas(aux)
 
-                if not df_bolsas.empty and "Modalidade" in df_bolsas.columns:
-                    modalidades = sorted(
-                        df_bolsas["Modalidade"]
-                        .dropna()
-                        .astype(str)
-                        .str.strip()
-                        .unique()
-                        .tolist()
-                    )
+                if not df_bolsas.empty and {"Modalidade", "Categoria"}.issubset(df_bolsas.columns):
+                    df_bolsas = df_bolsas.copy()
+                    df_bolsas["Modalidade"] = df_bolsas["Modalidade"].astype(str).str.strip()
+                    df_bolsas["Categoria"] = df_bolsas["Categoria"].astype(str).str.strip()
+                    df_bolsas["Valor"] = pd.to_numeric(df_bolsas["Valor"], errors="coerce").fillna(0)
 
-                    modalidade = st.selectbox(
+                    modalidades = sorted(df_bolsas["Modalidade"].dropna().unique().tolist())
+                    modalidade = selectbox_obrigatorio(
                         "Modalidade da bolsa",
-                        modalidades if modalidades else ["Não informado"],
-                        key="parf_modalidade_bolsa"
+                        modalidades,
+                        key=f"parf_modalidade_bolsa_{form_seq}"
                     )
 
-                    categorias = sorted(
-                        df_bolsas.loc[
-                            df_bolsas["Modalidade"].astype(str).str.strip().str.casefold()
-                            == str(modalidade).strip().casefold(),
-                            "Categoria"
-                        ]
-                        .dropna()
-                        .astype(str)
-                        .str.strip()
-                        .unique()
-                        .tolist()
-                    )
+                    if modalidade:
+                        df_filtrado = df_bolsas[
+                            df_bolsas["Modalidade"].str.casefold() == str(modalidade).strip().casefold()
+                        ].copy()
+                        categorias = sorted(df_filtrado["Categoria"].dropna().unique().tolist())
+                        categoria = selectbox_obrigatorio(
+                            "Categoria da bolsa",
+                            categorias,
+                            key=f"parf_categoria_bolsa_{nome_seguro_arquivo(modalidade)}_{form_seq}"
+                        )
 
-                    categoria = st.selectbox(
-                        "Categoria da bolsa",
-                        categorias if categorias else ["Não informado"],
-                        key=f"parf_categoria_bolsa_{str(modalidade)}"
-                    )
+                        if categoria:
+                            valor_sugerido = obter_valor_bolsa(df_bolsas, modalidade, categoria)
+                            item = st.text_input(
+                                "Item",
+                                value=categoria,
+                                key=f"parf_item_bolsa_{nome_seguro_arquivo(categoria)}_{form_seq}"
+                            )
+                        else:
+                            item = st.text_input("Item", value="", key=f"parf_item_bolsa_vazio_{form_seq}")
+                    else:
+                        item = st.text_input("Item", value="", key=f"parf_item_bolsa_sem_modalidade_{form_seq}")
 
-                    valor_sugerido = obter_valor_bolsa(df_bolsas, modalidade, categoria)
+                    descricao = st.text_input("Descrição", value="Bolsa", key=f"parf_desc_bolsa_{form_seq}")
 
                 else:
-                    modalidade = st.text_input("Modalidade da bolsa")
-                    categoria = st.text_input("Categoria da bolsa")
-
-                item = st.text_input("Item", value=categoria, key=f"parf_item_bolsa_{str(categoria)}")
-                descricao = st.text_input("Descrição", value="Bolsa", key="parf_desc_bolsa")
+                    modalidade = st.text_input("Modalidade da bolsa", key=f"modalidade_bolsa_manual_{form_seq}")
+                    categoria = st.text_input("Categoria da bolsa", key=f"categoria_bolsa_manual_{form_seq}")
+                    item = st.text_input("Item", key=f"item_bolsa_manual_{form_seq}")
+                    descricao = st.text_input("Descrição", value="Bolsa", key=f"desc_bolsa_manual_{form_seq}")
 
             elif grupo in grupos_contratacao():
-                modalidade = st.selectbox(
-                    "Modalidade",
-                    [grupo],
-                    key=f"parf_modalidade_{grupo}"
-                )
+                modalidade = grupo
+                st.text_input("Modalidade", value=grupo, disabled=True, key=f"parf_modalidade_{nome_seguro_arquivo(grupo)}_{form_seq}")
 
                 opcoes = obter_lista_despesas(aux, grupo)
-                categoria = st.selectbox(
+                categoria = selectbox_obrigatorio(
                     "Categoria",
-                    opcoes if opcoes else ["Não informado"],
-                    key=f"parf_categoria_{grupo}"
+                    opcoes,
+                    key=f"parf_categoria_{nome_seguro_arquivo(grupo)}_{form_seq}"
                 )
 
-                item = st.text_input("Item específico", key=f"parf_item_{grupo}")
-                descricao = st.text_input("Descrição", key=f"parf_desc_{grupo}")
+                item = st.text_input("Item específico", value="", key=f"parf_item_{nome_seguro_arquivo(grupo)}_{form_seq}")
+                descricao = st.text_input("Descrição", value="", key=f"parf_desc_{nome_seguro_arquivo(grupo)}_{form_seq}")
 
             elif grupo == "Diárias":
                 df_diarias = obter_lista_diarias(aux)
                 opcoes = df_diarias["tipo"].tolist() if not df_diarias.empty else []
 
-                modalidade = st.selectbox(
+                modalidade = selectbox_obrigatorio(
                     "Tipo de diária/auxílio",
-                    opcoes if opcoes else ["Não informado"],
-                    key="parf_tipo_diaria"
+                    opcoes,
+                    key=f"parf_tipo_diaria_{form_seq}"
                 )
 
                 categoria = "Diárias e auxílio financeiro para viagem"
-                item = st.text_input("Item", value=modalidade, key=f"parf_item_diaria_{str(modalidade)}")
-                descricao = st.text_input("Descrição", value="Diária/Auxílio financeiro para viagem", key="parf_desc_diaria")
+                item = st.text_input("Item", value=modalidade, key=f"parf_item_diaria_{nome_seguro_arquivo(modalidade)}_{form_seq}")
+                descricao = st.text_input("Descrição", value="Diária/Auxílio financeiro para viagem", key=f"parf_desc_diaria_{form_seq}")
 
-                if not df_diarias.empty:
+                if modalidade and not df_diarias.empty:
                     valores = df_diarias.loc[
                         df_diarias["tipo"].astype(str).str.strip().str.casefold() == str(modalidade).strip().casefold(),
                         "valor"
@@ -1845,57 +2018,200 @@ elif pagina == "2. PARF":
             elif grupo == "Passagens":
                 opcoes = obter_lista_passagens(aux)
 
-                modalidade = st.selectbox(
+                modalidade = selectbox_obrigatorio(
                     "Tipo de passagem",
-                    opcoes if opcoes else ["Não informado"],
-                    key="parf_tipo_passagem"
+                    opcoes,
+                    key=f"parf_tipo_passagem_{form_seq}"
                 )
 
                 categoria = "Passagens"
-                item = st.text_input("Item", value=modalidade, key=f"parf_item_passagem_{str(modalidade)}")
-                descricao = st.text_input("Descrição", value="Passagem", key="parf_desc_passagem")
+                item = st.text_input("Item", value=modalidade, key=f"parf_item_passagem_{nome_seguro_arquivo(modalidade)}_{form_seq}")
+                descricao = st.text_input("Descrição", value="Passagem", key=f"parf_desc_passagem_{form_seq}")
 
             elif grupo == "Celetistas":
                 modalidade = st.selectbox(
                     "Modalidade",
-                    ["CLT - Celetista"]
+                    ["Selecione...", "CLT - Celetista"],
+                    index=0,
+                    key=f"parf_modalidade_clt_{form_seq}"
                 )
-                categoria = st.text_input("Cargo/Função")
-                item = st.text_input("Item", value=categoria)
-                descricao = st.text_input("Descrição", value="Contratação celetista")
+                if modalidade == "Selecione...":
+                    modalidade = ""
+                categoria = st.text_input("Cargo/Função", value="", key=f"parf_cargo_clt_{form_seq}")
+                item = st.text_input("Item", value=categoria, key=f"parf_item_clt_{form_seq}")
+                descricao = st.text_input("Descrição", value="Contratação celetista", key=f"parf_desc_clt_{form_seq}")
+
+            elif grupo == "Importação":
+                modalidade = st.selectbox(
+                    "Modalidade de despesas acessórias",
+                    ["Selecione...", "Importação padrão — 60%", "Importação reduzida — 20%"],
+                    index=0,
+                    key=f"parf_modalidade_importacao_{form_seq}"
+                )
+                if modalidade == "Importação padrão — 60%":
+                    percentual_adicional = 60.0
+                elif modalidade == "Importação reduzida — 20%":
+                    percentual_adicional = 20.0
+                else:
+                    modalidade = ""
+                    percentual_adicional = 0.0
+
+                categoria = "Importação"
+                item = st.text_input("Item importado", value="", key=f"parf_item_importacao_{form_seq}")
+                descricao = st.text_input("Descrição", value="Importação", key=f"parf_desc_importacao_{form_seq}")
+
+            elif grupo in ["Ressarcimento", "Contrapartida", "Prospecção"]:
+                modalidade = grupo
+                categoria = grupo
+                item = st.text_input("Item", value=grupo, key=f"parf_item_percentual_{nome_seguro_arquivo(grupo)}_{form_seq}")
+                descricao = st.text_input("Descrição", value=f"{grupo} calculado sobre o valor aprovado/previsto", key=f"parf_desc_percentual_{nome_seguro_arquivo(grupo)}_{form_seq}")
+
+            elif grupo == "Tarifas bancárias":
+                modalidade = "Tarifas bancárias"
+                categoria = "Tarifas bancárias e manutenção de conta"
+                item = "Tarifas bancárias"
+                descricao = "Rubrica fixa: tarifas por operação bancária e manutenção mensal de conta"
+                st.markdown(
+                    f"""
+                    <div class="facto-info-card">
+                        <strong>Rubrica fixa do projeto</strong><br>
+                        Calculada automaticamente a partir das operações já lançadas no PARF e da vigência cadastrada.
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
             else:
-                modalidade = st.text_input("Modalidade")
-                categoria = st.text_input("Categoria")
-                item = st.text_input("Item")
-                descricao = st.text_input("Descrição")
+                modalidade = st.text_input("Modalidade", value="", key=f"parf_modalidade_generica_{nome_seguro_arquivo(grupo)}_{form_seq}")
+                categoria = st.text_input("Categoria", value="", key=f"parf_categoria_generica_{nome_seguro_arquivo(grupo)}_{form_seq}")
+                item = st.text_input("Item", value="", key=f"parf_item_generico_{nome_seguro_arquivo(grupo)}_{form_seq}")
+                descricao = st.text_input("Descrição", value="", key=f"parf_desc_generico_{nome_seguro_arquivo(grupo)}_{form_seq}")
 
         with col2:
-            quantidade = st.number_input("Quantidade", min_value=0.0, step=1.0, value=1.0)
-            meses = st.number_input("Meses", min_value=0.0, step=1.0, value=1.0)
+            projeto_atual_form = obter_projeto_atual() or {}
+            vigencia_projeto_form = float(projeto_atual_form.get("prazo_meses", 0) or 0)
+
+            if grupo in ["Bolsas", "Celetistas", "RPA"]:
+                quantidade = st.number_input(
+                    "Quantidade",
+                    min_value=0.0,
+                    step=1.0,
+                    value=1.0,
+                    key=f"parf_quantidade_{nome_seguro_arquivo(grupo)}_{form_seq}"
+                )
+                meses = st.number_input(
+                    "Meses",
+                    min_value=0.0,
+                    step=1.0,
+                    value=1.0,
+                    key=f"parf_meses_{nome_seguro_arquivo(grupo)}_{form_seq}"
+                )
+                if vigencia_projeto_form and meses > vigencia_projeto_form:
+                    st.warning(
+                        f"Atenção: o tempo informado ({meses:.0f} meses) é maior que a vigência do projeto "
+                        f"({vigencia_projeto_form:.0f} meses). Ajuste a vigência da rubrica ou revise o cadastro do projeto."
+                    )
+
+            elif grupo == "Tarifas bancárias":
+                df_parf_base = carregar_parf()
+                df_parf_atual_base = df_parf_base[
+                    (df_parf_base["id_projeto"].astype(str) == str(id_atual)) &
+                    (df_parf_base["versao"].astype(int) == int(versao_atual))
+                ].copy() if not df_parf_base.empty else pd.DataFrame()
+                vigencia_calc = obter_vigencia_projeto_atual()
+                operacoes_tarifa, valor_operacoes_tarifa, valor_manutencao_tarifa, valor_sugerido = calcular_tarifas_bancarias_estimadas(df_parf_atual_base, vigencia_calc)
+                quantidade = 1.0
+                meses = 1.0
+                st.markdown(
+                    f"""
+                    <div class="facto-info-card">
+                        <strong>Composição automática</strong><br>
+                        Operações estimadas: <strong>{operacoes_tarifa:.0f}</strong><br>
+                        Tarifas por operação: {moeda(valor_operacoes_tarifa)}<br>
+                        Manutenção de conta: {moeda(valor_manutencao_tarifa)} ({moeda(100)} × {vigencia_calc:.0f} meses)<br>
+                        <strong>Total calculado: {moeda(valor_sugerido)}</strong>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            elif grupo in ["Ressarcimento", "Contrapartida", "Prospecção"]:
+                quantidade = 1.0
+                meses = 1.0
+                percentual_aplicado = st.number_input(
+                    "Percentual sobre o valor aprovado/previsto (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.1,
+                    value=0.0,
+                    format="%.2f",
+                    key=f"parf_percentual_{nome_seguro_arquivo(grupo)}_{form_seq}"
+                )
+                valor_aprovado_base = float((obter_projeto_atual() or {}).get("valor_aprovado", 0) or 0)
+                valor_sugerido = valor_aprovado_base * (percentual_aplicado / 100)
+                st.markdown(
+                    f"""
+                    <div class="facto-info-card">
+                        <strong>Valor calculado:</strong> {moeda(valor_sugerido)}<br>
+                        Base de cálculo: {moeda(valor_aprovado_base)} × {percentual_aplicado:.2f}%
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            else:
+                quantidade = 1.0
+                meses = 1.0
+                st.info("Para esta rubrica, informe o valor total previsto no campo Valor unitário.")
 
         with col3:
-            valor_unitario = st.number_input(
-                "Valor unitário",
-                min_value=0.0,
-                step=100.0,
-                format="%.2f",
-                value=float(valor_sugerido or 0.0)
-            )
+            if grupo in ["Ressarcimento", "Contrapartida", "Prospecção", "Tarifas bancárias"]:
+                valor_unitario = float(valor_sugerido or 0)
+                st.markdown(
+                    f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Valor calculado da rubrica</div>
+                        <div class="metric-value">{moeda(valor_unitario)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                valor_unitario = st.number_input(
+                    "Valor unitário",
+                    min_value=0.0,
+                    step=100.0,
+                    format="%.2f",
+                    value=float(valor_sugerido or 0),
+                    key=f"parf_valor_unitario_{nome_seguro_arquivo(grupo)}_{form_seq}"
+                )
 
             if grupo == "RPA":
                 percentual_adicional = 20.0
                 st.info("INSS patronal considerado: 20%")
 
             elif grupo == "Importação":
-                percentual_adicional = 60.0
-                st.info("Despesas acessórias de importação consideradas: 60%")
+                if percentual_adicional:
+                    st.info(f"Despesas acessórias de importação consideradas: {percentual_adicional:.0f}%")
+                else:
+                    st.warning("Selecione a modalidade de despesas acessórias da importação.")
+
+            elif grupo == "Tarifas bancárias":
+                st.markdown(
+                    """
+                    <div class="facto-info-card">
+                        <strong>Parâmetros:</strong> R$ 2,06 por operação bancária e R$ 100,00 por mês de manutenção de conta.
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
             if grupo in grupos_contratacao():
                 marcacao = st.radio(
                     "Tratamento da contratação",
                     ["Automático", "Dispensa", "Inexigibilidade"],
-                    horizontal=True
+                    horizontal=True,
+                    key=f"parf_tratamento_{nome_seguro_arquivo(grupo)}_{form_seq}"
                 )
             else:
                 marcacao = "Automático"
@@ -1924,28 +2240,36 @@ elif pagina == "2. PARF":
         salvar_item = st.form_submit_button("Adicionar item ao PARF")
 
     if salvar_item:
-        novo = {
-            "id_item": gerar_id(),
-            "id_projeto": id_atual,
-            "versao": versao_atual,
-            "grupo": grupo,
-            "item": item,
-            "modalidade": modalidade,
-            "categoria": categoria,
-            "descricao": descricao,
-            "quantidade": quantidade,
-            "meses": meses,
-            "valor_unitario": valor_unitario,
-            "percentual_adicional": percentual_adicional,
-            "valor_adicional": valor_adicional,
-            "modalidade_contratacao": modalidade_contratacao,
-            "total": total
-        }
+        if grupo in ["Ressarcimento", "Contrapartida", "Prospecção"] and valor_unitario <= 0:
+            st.warning("Informe um percentual maior que zero para incluir esta rubrica no PARF.")
+        elif grupo == "Tarifas bancárias" and valor_unitario <= 0:
+            st.warning("A tarifa bancária só poderá ser lançada após haver vigência cadastrada ou operações estimadas.")
+        elif grupo in ["Bolsas", "Material de consumo", "Material permanente", "Serviço PJ", "Diárias", "Passagens", "Importação", "Celetistas"] and not modalidade:
+            st.warning("Selecione/preencha a modalidade antes de adicionar o item.")
+        else:
+            novo = {
+                "id_item": gerar_id(),
+                "id_projeto": id_atual,
+                "versao": versao_atual,
+                "grupo": grupo,
+                "item": item,
+                "modalidade": modalidade,
+                "categoria": categoria,
+                "descricao": descricao,
+                "quantidade": quantidade,
+                "meses": meses,
+                "valor_unitario": valor_unitario,
+                "percentual_adicional": percentual_adicional,
+                "valor_adicional": valor_adicional,
+                "modalidade_contratacao": modalidade_contratacao,
+                "total": total
+            }
 
-        df_parf = pd.concat([df_parf, pd.DataFrame([novo])], ignore_index=True)
-        salvar_excel(df_parf, ARQ_PARF)
-        st.success("Item adicionado ao PARF.")
-        st.rerun()
+            df_parf = pd.concat([df_parf, pd.DataFrame([novo])], ignore_index=True)
+            salvar_excel(df_parf, ARQ_PARF)
+            st.session_state["parf_form_seq"] += 1
+            st.success("Item adicionado ao PARF.")
+            st.rerun()
 
     st.divider()
 
@@ -1957,13 +2281,14 @@ elif pagina == "2. PARF":
         df_atual = df_parf[
             (df_parf["id_projeto"].astype(str) == str(id_atual)) &
             (df_parf["versao"].astype(int) == int(versao_atual))
-        ]
+        ].copy()
 
     if df_atual.empty:
         st.info("Nenhum item cadastrado no PARF ainda.")
     else:
         st.subheader("Itens do PARF")
 
+        df_atual["total"] = pd.to_numeric(df_atual["total"], errors="coerce").fillna(0)
         resumo = df_atual.groupby("grupo", as_index=False)["total"].sum()
         total_execucao = resumo["total"].sum()
 
@@ -1983,45 +2308,36 @@ elif pagina == "2. PARF":
         })
 
         colunas_exibir = [
-            "Grupo",
-            "Item",
-            "Modalidade",
-            "Categoria",
-            "Descrição",
-            "Quantidade",
-            "Meses",
-            "Valor unitário",
-            "% adicional",
-            "Valor adicional",
-            "Modalidade de contratação",
-            "Total"
+            "Grupo", "Item", "Modalidade", "Categoria", "Descrição",
+            "Quantidade", "Meses", "Valor unitário", "% adicional",
+            "Valor adicional", "Modalidade de contratação", "Total"
         ]
 
-        for coluna in ["Valor unitário", "Valor adicional", "Total"]:
-            df_visual[coluna] = df_visual[coluna].apply(moeda)
+        df_visual_total = df_visual[colunas_exibir].copy()
+        for col_num in ["Quantidade", "Valor unitário", "Valor adicional", "Total"]:
+            if col_num in df_visual_total.columns:
+                df_visual_total[col_num] = pd.to_numeric(df_visual_total[col_num], errors="coerce").fillna(0)
 
-        st.dataframe(
-            df_visual[colunas_exibir],
-            use_container_width=True,
-            hide_index=True
-        )
+        linha_total = {col: "" for col in colunas_exibir}
+        linha_total["Grupo"] = "Total"
+        linha_total["Quantidade"] = df_visual_total["Quantidade"].sum() if "Quantidade" in df_visual_total.columns else 0
+        linha_total["Valor unitário"] = df_visual_total["Valor unitário"].sum() if "Valor unitário" in df_visual_total.columns else 0
+        linha_total["Valor adicional"] = df_visual_total["Valor adicional"].sum() if "Valor adicional" in df_visual_total.columns else 0
+        linha_total["Total"] = df_visual_total["Total"].sum() if "Total" in df_visual_total.columns else 0
+        df_visual_total = pd.concat([df_visual_total, pd.DataFrame([linha_total])], ignore_index=True)
+
+        for coluna in ["Valor unitário", "Valor adicional", "Total"]:
+            df_visual_total[coluna] = df_visual_total[coluna].apply(moeda)
+
+        st.dataframe(df_visual_total, use_container_width=True, hide_index=True)
 
         col1, col2 = st.columns([2, 1])
 
         with col1:
-            resumo_visual = resumo.rename(columns={
-                "grupo": "Grupo",
-                "total": "Total"
-            })
-
+            resumo_visual = resumo.rename(columns={"grupo": "Grupo", "total": "Total"})
             resumo_visual["Total"] = resumo_visual["Total"].apply(moeda)
-
             st.markdown("### Resumo por rubrica")
-            st.dataframe(
-                resumo_visual,
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(resumo_visual, use_container_width=True, hide_index=True)
 
         with col2:
             st.markdown(
@@ -2034,100 +2350,78 @@ elif pagina == "2. PARF":
                 unsafe_allow_html=True
             )
 
+        st.markdown("### Composição do valor do projeto")
+        projeto_atual = obter_projeto_atual() or {}
+        valor_total_projeto = float(projeto_atual.get("valor_aprovado", 0) or 0)
+
+        try:
+            resumo_doa_comp = obter_resumo_doa_proposta(df_atual)
+            doa_final = float(pd.to_numeric(resumo_doa_comp.get("Valor final", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        except Exception:
+            doa_final = 0.0
+
+        valor_com_doa = total_execucao + doa_final
+        saldo_disponivel_para_execucao = valor_total_projeto - doa_final if valor_total_projeto else 0.0
+        diferenca_total = valor_total_projeto - valor_com_doa if valor_total_projeto else 0.0
+
+        comp1, comp2, comp3, comp4 = st.columns(4)
+        comp1.metric("Rubricas de execução", moeda(total_execucao))
+        comp2.metric("DOA estimada/final", moeda(doa_final))
+        comp3.metric("Execução + DOA", moeda(valor_com_doa))
+        comp4.metric("Valor aprovado/previsto", moeda(valor_total_projeto))
+
+        st.markdown(
+            f"""
+            <div class="facto-callout">
+                <strong>Leitura gerencial:</strong>
+                o valor aprovado do projeto precisa comportar as rubricas de execução e a DOA.
+                Com a DOA estimada, o valor disponível para execução técnica seria <strong>{moeda(saldo_disponivel_para_execucao)}</strong>.
+                Diferença entre valor aprovado e composição atual: <strong>{moeda(diferenca_total)}</strong>.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
         st.divider()
         st.subheader("Editar ou excluir item do PARF")
 
         df_edicao = df_atual.copy()
-
-        # Garante id_item para itens antigos
         if "id_item" not in df_edicao.columns:
             df_edicao["id_item"] = [gerar_id() for _ in range(len(df_edicao))]
 
         df_edicao["label_edicao"] = (
-            df_edicao["grupo"].fillna("").astype(str)
-            + " | "
-            + df_edicao["item"].fillna("Sem item").astype(str)
-            + " | "
-            + df_edicao["total"].apply(moeda)
+            df_edicao["grupo"].fillna("").astype(str) + " | " +
+            df_edicao["item"].fillna("Sem item").astype(str) + " | " +
+            df_edicao["total"].apply(moeda)
         )
 
-        item_escolhido = st.selectbox(
-            "Selecione um item salvo",
-            df_edicao["label_edicao"].tolist()
-        )
-
+        item_escolhido = st.selectbox("Selecione um item salvo", df_edicao["label_edicao"].tolist())
         linha_item = df_edicao[df_edicao["label_edicao"] == item_escolhido].iloc[0]
 
         with st.form("form_editar_item_parf"):
             col_e1, col_e2, col_e3 = st.columns(3)
-
             grupos_lista = grupos_parf()
-
             grupo_atual = str(linha_item.get("grupo", "Bolsas") or "Bolsas")
             index_grupo = grupos_lista.index(grupo_atual) if grupo_atual in grupos_lista else 0
 
             with col_e1:
-                novo_grupo = st.selectbox(
-                    "Grupo",
-                    grupos_lista,
-                    index=index_grupo
-                )
-
-                nova_modalidade = st.text_input(
-                    "Modalidade",
-                    value=str(linha_item.get("modalidade", "") or "")
-                )
-
-                nova_categoria = st.text_input(
-                    "Categoria",
-                    value=str(linha_item.get("categoria", "") or "")
-                )
-
-                novo_item = st.text_input(
-                    "Item",
-                    value=str(linha_item.get("item", "") or "")
-                )
-
-                nova_descricao = st.text_input(
-                    "Descrição",
-                    value=str(linha_item.get("descricao", "") or "")
-                )
+                novo_grupo = st.selectbox("Grupo", grupos_lista, index=index_grupo)
+                nova_modalidade = st.text_input("Modalidade", value=str(linha_item.get("modalidade", "") or ""))
+                nova_categoria = st.text_input("Categoria", value=str(linha_item.get("categoria", "") or ""))
+                novo_item = st.text_input("Item", value=str(linha_item.get("item", "") or ""))
+                nova_descricao = st.text_input("Descrição", value=str(linha_item.get("descricao", "") or ""))
 
             with col_e2:
-                nova_quantidade = st.number_input(
-                    "Quantidade",
-                    min_value=0.0,
-                    step=1.0,
-                    value=float(linha_item.get("quantidade", 0) or 0)
-                )
-
-                novos_meses = st.number_input(
-                    "Meses",
-                    min_value=0.0,
-                    step=1.0,
-                    value=float(linha_item.get("meses", 0) or 0)
-                )
-
+                nova_quantidade = st.number_input("Quantidade", min_value=0.0, step=1.0, value=float(linha_item.get("quantidade", 0) or 0))
+                novos_meses = st.number_input("Meses", min_value=0.0, step=1.0, value=float(linha_item.get("meses", 0) or 0))
                 novo_valor_unitario = st.number_input(
-                    "Valor unitário",
-                    min_value=0.0,
-                    step=100.0,
-                    format="%.2f",
+                    "Valor unitário", min_value=0.0, step=100.0, format="%.2f",
                     value=float(linha_item.get("valor_unitario", 0) or 0)
                 )
 
             with col_e3:
-                novo_percentual_adicional = st.number_input(
-                    "% adicional",
-                    min_value=0.0,
-                    step=1.0,
-                    value=float(linha_item.get("percentual_adicional", 0) or 0)
-                )
-
-                nova_modalidade_contratacao = st.text_input(
-                    "Modalidade de contratação",
-                    value=str(linha_item.get("modalidade_contratacao", "") or "")
-                )
+                novo_percentual_adicional = st.number_input("% adicional", min_value=0.0, step=1.0, value=float(linha_item.get("percentual_adicional", 0) or 0))
+                nova_modalidade_contratacao = st.text_input("Modalidade de contratação", value=str(linha_item.get("modalidade_contratacao", "") or ""))
 
             novo_subtotal = nova_quantidade * max(1, novos_meses) * novo_valor_unitario
             novo_valor_adicional = novo_subtotal * (novo_percentual_adicional / 100)
@@ -2136,10 +2430,8 @@ elif pagina == "2. PARF":
             st.markdown(f"**Novo total estimado:** {moeda(novo_total)}")
 
             col_btn1, col_btn2 = st.columns(2)
-
             with col_btn1:
                 salvar_edicao = st.form_submit_button("Salvar alteração")
-
             with col_btn2:
                 excluir_item = st.form_submit_button("Excluir item")
 
@@ -2158,9 +2450,7 @@ elif pagina == "2. PARF":
                 "modalidade_contratacao": nova_modalidade_contratacao,
                 "total": novo_total
             }
-
             ok = atualizar_item_parf(linha_item["id_item"], dados_atualizados)
-
             if ok:
                 st.success("Item atualizado com sucesso.")
                 st.rerun()
@@ -2169,7 +2459,6 @@ elif pagina == "2. PARF":
 
         if excluir_item:
             ok = excluir_item_parf(linha_item["id_item"])
-
             if ok:
                 st.success("Item excluído com sucesso.")
                 st.rerun()
@@ -2333,31 +2622,36 @@ elif pagina == "4. DOA":
     resumo_componentes = memoria.groupby("componente", as_index=False)["valor_calculado"].sum()
 
     total_calculado = float(resumo_componentes["valor_calculado"].sum())
+    total_parf_execucao = float(pd.to_numeric(df_parf_atual["total"], errors="coerce").fillna(0).sum())
     limite_legal = valor_projeto * 0.15
     fator_limitador = min(1, limite_legal / total_calculado) if total_calculado > 0 else 1
     total_ajustado = total_calculado * fator_limitador
-    percentual_calculado = total_calculado / valor_projeto if valor_projeto else 0
+    percentual_calculado = total_calculado / total_parf_execucao if total_parf_execucao else 0
     deficit_operacional = max(0, total_calculado - limite_legal)
 
     resumo_componentes["valor_ajustado"] = resumo_componentes["valor_calculado"] * fator_limitador
 
     st.markdown("### Resultado da DOA")
 
-    c1, c2, c3 = st.columns(3)
-    c4, c5, c6 = st.columns(3)
-
-    with c1:
-        st.metric("DOA calculada", moeda(total_calculado))
-    with c2:
-        st.metric("Percentual calculado", f"{percentual_calculado:.2%}".replace(".", ","))
-    with c3:
-        st.metric("Limite legal — 15%", moeda(limite_legal))
-    with c4:
-        st.metric("DOA aplicável", moeda(total_ajustado))
-    with c5:
-        st.metric("Fator limitador", f"{fator_limitador:.2%}".replace(".", ","))
-    with c6:
-        st.metric("Déficit operacional", moeda(deficit_operacional))
+    card_cols = st.columns(5)
+    cards = [
+        ("DOA calculada", moeda(total_calculado)),
+        ("Percentual calculado", f"{percentual_calculado:.2%}".replace(".", ",")),
+        ("Limite legal", moeda(limite_legal)),
+        ("DOA real", moeda(total_ajustado)),
+        ("Déficit operacional", moeda(deficit_operacional)),
+    ]
+    for col, (label, valor) in zip(card_cols, cards):
+        with col:
+            st.markdown(
+                f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{valor}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
     st.markdown("### Fatores ICP e Giro aplicados")
 
@@ -2374,7 +2668,15 @@ elif pagina == "4. DOA":
 
     st.markdown("### Composição da DOA por componente")
 
-    resumo_visual = resumo_componentes.rename(columns={
+    resumo_tabela = resumo_componentes.copy()
+    total_row = {
+        "componente": "Total",
+        "valor_calculado": resumo_tabela["valor_calculado"].sum(),
+        "valor_ajustado": resumo_tabela["valor_ajustado"].sum(),
+    }
+    resumo_tabela = pd.concat([resumo_tabela, pd.DataFrame([total_row])], ignore_index=True)
+
+    resumo_visual = resumo_tabela.rename(columns={
         "componente": "Componente da DOA",
         "valor_calculado": "Valor calculado",
         "valor_ajustado": "Valor ajustado pelo limite"
@@ -2390,6 +2692,7 @@ elif pagina == "4. DOA":
             "atividade": "Atividade",
             "quantidade_operacional": "Quantidade operacional",
             "tempo_base_h": "Tempo base (h)",
+            "vigencia_meses": "Vigência considerada (meses)",
             "horas_estimadas": "Horas estimadas",
             "custo_hora_pessoal": "Custo hora pessoal",
             "custo_hora_adm": "Custo hora administrativo",
@@ -2405,35 +2708,31 @@ elif pagina == "4. DOA":
 
         st.dataframe(memoria_visual, use_container_width=True, hide_index=True)
 
-    with st.expander("Ver custo/hora por centro de custo"):
-        custo_visual = custo_hora_df.rename(columns={
-            "setor": "Setor",
-            "custo_hora_pessoal": "Custo hora pessoal",
-            "custo_hora_adm": "Custo hora administrativo rateado",
-            "custo_hora_total": "Custo hora total"
-        })
-        custo_visual = formatar_tabela_moeda(
-            custo_visual,
-            ["Custo hora pessoal", "Custo hora administrativo rateado", "Custo hora total"]
-        )
-        st.dataframe(custo_visual, use_container_width=True, hide_index=True)
-
-    with st.expander("Explicações das faixas ICP e Giro"):
-        bases = carregar_custos_indicadores()
-
-        st.markdown("#### ICP")
-        df_icp = bases.get("ICP", pd.DataFrame())
-        if not df_icp.empty:
-            st.dataframe(df_icp, use_container_width=True, hide_index=True)
+    with st.expander("Explicações das faixas ICP e Giro escolhidas"):
+        df_indicadores = carregar_icp_giro()
+        if not df_indicadores.empty:
+            filtro_ind = (
+                (df_indicadores["id_projeto"].astype(str) == str(id_atual)) &
+                (df_indicadores["versao"].astype(int) == int(versao_atual))
+            )
+            df_ind_atual = df_indicadores[filtro_ind].copy()
         else:
-            st.info("Aba ICP não encontrada no arquivo custos_indicadores.xlsx.")
+            df_ind_atual = pd.DataFrame()
 
-        st.markdown("#### Giro")
-        df_giro = bases.get("GIRO", pd.DataFrame())
-        if not df_giro.empty:
-            st.dataframe(df_giro, use_container_width=True, hide_index=True)
+        if df_ind_atual.empty:
+            st.info("Nenhum ICP/Giro salvo para esta proposta. A DOA está usando valores médios padrão.")
         else:
-            st.info("Aba GIRO não encontrada no arquivo custos_indicadores.xlsx.")
+            df_ind_atual["Explicação da nota"] = df_ind_atual.apply(
+                lambda r: explicacao_nota_indicador(str(r.get("tipo", "")), str(r.get("indicador", "")), int(r.get("nota", 3) or 3)),
+                axis=1
+            )
+            df_ind_visual = df_ind_atual.rename(columns={
+                "tipo": "Tipo",
+                "indicador": "Indicador",
+                "nota": "Nota",
+                "justificativa": "Justificativa"
+            })[["Tipo", "Indicador", "Nota", "Explicação da nota", "Justificativa"]]
+            st.dataframe(df_ind_visual, use_container_width=True, hide_index=True)
 
     if st.button("Salvar resultado da DOA", type="primary"):
         df_doa = carregar_doa()
@@ -2535,4 +2834,28 @@ elif pagina == "6. Histórico":
     if df.empty:
         st.info("Nenhuma proposta cadastrada.")
     else:
-        st.dataframe(df, use_container_width=True)
+        df_visual = df.rename(columns={
+            "id_projeto": "ID da proposta",
+            "versao": "Versão",
+            "status": "Status",
+            "nome_projeto": "Nome do projeto",
+            "coordenador": "Coordenador",
+            "email_coordenador": "E-mail do coordenador",
+            "instituicao_executora": "Instituição executora",
+            "campus": "Campus",
+            "financiador": "Financiador",
+            "tipo_financiador": "Tipo de financiador",
+            "tipo_instrumento": "Tipo de instrumento",
+            "data_inicio": "Data de início",
+            "data_fim": "Data de fim",
+            "prazo_meses": "Prazo (meses)",
+            "valor_aprovado": "Valor aprovado/previsto",
+            "objeto_resumido": "Objeto resumido",
+            "area_tematica": "Área temática",
+            "responsavel_facto": "Responsável Facto",
+            "data_criacao": "Data de criação",
+            "data_atualizacao": "Data de atualização"
+        }).copy()
+        if "Valor aprovado/previsto" in df_visual.columns:
+            df_visual["Valor aprovado/previsto"] = df_visual["Valor aprovado/previsto"].apply(moeda)
+        st.dataframe(df_visual, use_container_width=True, hide_index=True)

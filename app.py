@@ -245,18 +245,26 @@ def carregar_projetos():
 def carregar_parf():
     df = carregar_excel(ARQ_PARF, colunas_parf())
 
-    # Compatibilidade com arquivos antigos sem id_item
-    if "id_item" not in df.columns:
-        df.insert(0, "id_item", [gerar_id() for _ in range(len(df))])
-        if not df.empty:
+    # Garante colunas flexíveis
+    for col in df.columns:
+        df[col] = df[col].astype("object")
+
+    df = df.where(pd.notnull(df), "")
+
+    if not df.empty:
+        mascara_sem_id = (
+            df["id_item"].isna()
+            | (df["id_item"].astype(str).str.strip() == "")
+            | (df["id_item"].astype(str).str.lower() == "nan")
+        )
+
+        if mascara_sem_id.any():
+            df.loc[mascara_sem_id, "id_item"] = [
+                gerar_id() for _ in range(mascara_sem_id.sum())
+            ]
             salvar_excel(df, ARQ_PARF)
 
-    # Garante todas as colunas esperadas
-    for coluna in colunas_parf():
-        if coluna not in df.columns:
-            df[coluna] = None
-
-    return df[colunas_parf()]
+    return df
 
 
 def carregar_icp_giro():
@@ -482,22 +490,28 @@ def mostrar_card_proposta():
 def atualizar_item_parf(id_item, dados_atualizados):
     df = carregar_parf()
 
-    if df.empty or "id_item" not in df.columns:
-        return False
+    # Garante colunas como tipo flexível para aceitar texto, número e vazio
+    for col in df.columns:
+        df[col] = df[col].astype("object")
+
+    # Troca NaN por vazio
+    df = df.where(pd.notnull(df), "")
 
     filtro = df["id_item"].astype(str) == str(id_item)
 
-    if not filtro.any():
-        return False
+    if filtro.any():
+        idx = df.index[filtro][0]
 
-    idx = df.index[filtro][0]
+        for k, v in dados_atualizados.items():
+            if k in df.columns:
+                if pd.isna(v):
+                    v = ""
+                df.at[idx, k] = v
 
-    for k, v in dados_atualizados.items():
-        if k in df.columns:
-            df.at[idx, k] = v
+        salvar_excel(df, ARQ_PARF)
+        return True
 
-    salvar_excel(df, ARQ_PARF)
-    return True
+    return False
 
 
 def excluir_item_parf(id_item):

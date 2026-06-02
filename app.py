@@ -1638,6 +1638,45 @@ def gerar_proposta_docx():
     return saida
 
 
+
+# =========================
+# AUTENTICAÇÃO SIMPLES
+# =========================
+
+USUARIOS_AUTORIZADOS = {
+    "laiz": "laiz@facto",
+    "katarina": "katarina@facto",
+    "marcos": "marcos@facto",
+    "eliane": "eliane@facto",
+    "daiane": "daiane@facto",
+    "everton": "everton@facto",
+}
+
+if "autenticado" not in st.session_state:
+    st.session_state["autenticado"] = False
+
+if "usuario_logado" not in st.session_state:
+    st.session_state["usuario_logado"] = ""
+
+if not st.session_state["autenticado"]:
+    st.markdown("## Acesso à plataforma")
+    st.caption("Informe login e senha para acessar a plataforma de precificação.")
+
+    with st.form("form_login"):
+        login = st.text_input("Login").strip().lower()
+        senha = st.text_input("Senha", type="password")
+        entrar = st.form_submit_button("Entrar")
+
+    if entrar:
+        if login in USUARIOS_AUTORIZADOS and senha == USUARIOS_AUTORIZADOS[login]:
+            st.session_state["autenticado"] = True
+            st.session_state["usuario_logado"] = login
+            st.rerun()
+        else:
+            st.error("Login ou senha inválidos.")
+
+    st.stop()
+
 # =========================
 # CABEÇALHO
 # =========================
@@ -1674,6 +1713,13 @@ with col_titulo:
 # =========================
 
 st.sidebar.title("Navegação")
+
+st.sidebar.caption(f"Usuário logado: {st.session_state.get("usuario_logado", "")}")
+if st.sidebar.button("Sair", use_container_width=True):
+    st.session_state["autenticado"] = False
+    st.session_state["usuario_logado"] = ""
+    st.rerun()
+
 
 acao = st.sidebar.radio(
     "Ação",
@@ -1960,7 +2006,9 @@ elif pagina == "2. PARF":
                         )
 
                         if categoria:
-                            valor_sugerido = obter_valor_bolsa(df_bolsas, modalidade, categoria)
+                            # O valor da bolsa não é preenchido automaticamente.
+                            # A tabela auxiliar serve apenas para orientar modalidade/categoria.
+                            valor_sugerido = 0.0
                             item = st.text_input(
                                 "Item",
                                 value=categoria,
@@ -2111,6 +2159,16 @@ elif pagina == "2. PARF":
                         f"Atenção: o tempo informado ({meses:.0f} meses) é maior que a vigência do projeto "
                         f"({vigencia_projeto_form:.0f} meses). Ajuste a vigência da rubrica ou revise o cadastro do projeto."
                     )
+
+            elif grupo in ["Material de consumo", "Material permanente", "Serviço PJ", "Importação", "Diárias", "Passagens"]:
+                quantidade = st.number_input(
+                    "Quantidade",
+                    min_value=0.0,
+                    step=1.0,
+                    value=1.0,
+                    key=f"parf_quantidade_{nome_seguro_arquivo(grupo)}_{form_seq}"
+                )
+                meses = 1.0
 
             elif grupo == "Tarifas bancárias":
                 df_parf_base = carregar_parf()

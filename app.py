@@ -987,6 +987,88 @@ def componente_por_setor(setor):
     return mapa.get(str(setor), str(setor))
 
 
+def fator_governanca_por_valor(valor_projeto):
+    """
+    Fator institucional automático para representar governança, exposição,
+    controles e risco associados ao porte financeiro do projeto.
+    Não exige preenchimento pelo usuário.
+    """
+    try:
+        valor = max(0.0, float(valor_projeto or 0))
+    except Exception:
+        valor = 0.0
+
+    if valor <= 500_000:
+        return 1.00
+    if valor <= 2_000_000:
+        return 1.10
+    if valor <= 5_000_000:
+        return 1.20
+    if valor <= 10_000_000:
+        return 1.30
+    if valor <= 20_000_000:
+        return 1.40
+    return 1.50
+
+
+def calcular_ajustes_metodologicos_doa(total_calculado, valor_projeto, prazo_meses):
+    """
+    Consolida a metodologia institucional da DOA:
+
+    1. esforço operacional apurado pelas atividades;
+    2. sustentação temporal amortecida: +25% por ano adicional;
+    3. fator automático de governança conforme o porte financeiro;
+    4. piso institucional de 5% do valor aprovado/previsto;
+    5. teto legal de 15% do valor aprovado/previsto.
+
+    Todos os parâmetros são automáticos e não aparecem como campos de entrada.
+    """
+    try:
+        total_base = max(0.0, float(total_calculado or 0))
+    except Exception:
+        total_base = 0.0
+
+    try:
+        valor_base = max(0.0, float(valor_projeto or 0))
+    except Exception:
+        valor_base = 0.0
+
+    try:
+        meses = max(1.0, float(prazo_meses or 1))
+    except Exception:
+        meses = 1.0
+
+    anos = max(1.0, meses / 12.0)
+    fator_temporal = 1.0 + (0.25 * max(0.0, anos - 1.0))
+    fator_governanca = fator_governanca_por_valor(valor_base)
+
+    doa_metodologica = total_base * fator_temporal * fator_governanca
+    piso_institucional = valor_base * 0.05
+    limite_legal = valor_base * 0.15
+
+    doa_antes_teto = max(doa_metodologica, piso_institucional)
+    doa_final = min(doa_antes_teto, limite_legal) if valor_base > 0 else doa_antes_teto
+
+    fator_ajuste_final = (doa_final / total_base) if total_base > 0 else 0.0
+    percentual_final = (doa_final / valor_base) if valor_base > 0 else 0.0
+    deficit_operacional = max(0.0, doa_antes_teto - limite_legal) if valor_base > 0 else 0.0
+
+    return {
+        "anos_vigencia": anos,
+        "fator_temporal": fator_temporal,
+        "fator_governanca": fator_governanca,
+        "doa_operacional": total_base,
+        "doa_metodologica": doa_metodologica,
+        "piso_institucional": piso_institucional,
+        "limite_legal": limite_legal,
+        "doa_antes_teto": doa_antes_teto,
+        "doa_final": doa_final,
+        "fator_ajuste_final": fator_ajuste_final,
+        "percentual_final": percentual_final,
+        "deficit_operacional": deficit_operacional,
+    }
+
+
 def fator_por_nota(nota):
     """Escala 1 a 5: 1=0,90; 2=1,00; 3=1,10; 4=1,20; 5=1,30."""
     try:
@@ -1154,13 +1236,34 @@ def calcular_custo_hora_setor(bases):
     return setor[["setor", "custo_hora_pessoal", "custo_hora_adm", "custo_hora_total"]]
 
 
-def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, fator_icp, fator_giro, fator_complexidade, componente_forcado=None, vigencia_meses=None):
-    if quantidade is None:
-        quantidade = 0
+def adicionar_linha_doa(
+    linhas,
+    tempo_df,
+    custo_hora_df,
+    atividade,
+    quantidade,
+    fator_icp,
+    fator_giro,
+    fator_complexidade,
+    tipo_recorrencia="pontual",
+    meses_aplicaveis=1,
+    componente_forcado=None,
+):
+    """Adiciona uma atividade à memória da DOA sem multiplicar tudo pela vigência.
+
+    Regras:
+    - pontual: quantidade × tempo-base;
+    - ocorrencia: ocorrências totais × tempo-base;
+    - mensal: quantidade × tempo-base × meses aplicáveis.
+
+    O parâmetro ``quantidade`` deve representar a unidade operacional real da
+    atividade. A vigência só é aplicada quando ``tipo_recorrencia`` for mensal.
+    """
     try:
-        quantidade = float(quantidade)
+        quantidade = float(quantidade or 0)
     except Exception:
-        quantidade = 0
+        quantidade = 0.0
+
     if quantidade <= 0:
         return
 
@@ -1168,20 +1271,24 @@ def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, 
     if not info:
         return
 
-    if vigencia_meses is None:
-        try:
-            projeto_atual = obter_projeto_atual() or {}
-            vigencia_meses = float(projeto_atual.get("prazo_meses", 1) or 1)
-        except Exception:
-            vigencia_meses = 1
     try:
-        vigencia_meses = max(1.0, float(vigencia_meses or 1))
+        meses_aplicaveis = max(1.0, float(meses_aplicaveis or 1))
     except Exception:
-        vigencia_meses = 1.0
+        meses_aplicaveis = 1.0
+
+    tipo_recorrencia = str(tipo_recorrencia or "pontual").strip().lower()
+    if tipo_recorrencia not in {"pontual", "ocorrencia", "mensal"}:
+        tipo_recorrencia = "pontual"
 
     setor = info.get("setor")
     tempo_base = float(info.get("tempo_base_h") or 0)
-    horas_estimadas = quantidade * tempo_base * vigencia_meses
+
+    if tipo_recorrencia == "mensal":
+        horas_estimadas = quantidade * tempo_base * meses_aplicaveis
+        meses_considerados = meses_aplicaveis
+    else:
+        horas_estimadas = quantidade * tempo_base
+        meses_considerados = 1.0
 
     custo_setor = custo_hora_df[custo_hora_df["setor"].astype(str) == str(setor)]
 
@@ -1202,7 +1309,7 @@ def adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade, quantidade, 
         "atividade": info.get("atividade"),
         "quantidade_operacional": quantidade,
         "tempo_base_h": tempo_base,
-        "vigencia_meses": vigencia_meses,
+        "vigencia_meses": meses_considerados,
         "horas_estimadas": horas_estimadas,
         "custo_hora_pessoal": custo_hora_pessoal,
         "custo_hora_adm": custo_hora_adm,
@@ -1222,32 +1329,44 @@ def gerar_memoria_doa(df_parf_atual, bases):
     custo_hora_df = calcular_custo_hora_setor(bases)
     fator_icp, fator_giro, fator_complexidade, media_icp, media_giro = obter_fatores_complexidade()
 
+    projeto_atual = obter_projeto_atual() or {}
+    try:
+        vigencia_projeto = max(1.0, float(projeto_atual.get("prazo_meses", 1) or 1))
+    except Exception:
+        vigencia_projeto = 1.0
+
     linhas = []
 
     for _, row in df_parf_atual.iterrows():
-        grupo = str(row.get("grupo", ""))
-        modalidade_contratacao = str(row.get("modalidade_contratacao", ""))
+        grupo = str(row.get("grupo", "")).strip()
+        modalidade_contratacao = str(row.get("modalidade_contratacao", "")).strip()
 
-        qtd = float(pd.to_numeric(row.get("quantidade", 0), errors="coerce") or 0)
-        meses = float(pd.to_numeric(row.get("meses", 0), errors="coerce") or 0)
-        if meses <= 0:
-            meses = 1
+        qtd_num = pd.to_numeric(row.get("quantidade", 0), errors="coerce")
+        meses_num = pd.to_numeric(row.get("meses", 0), errors="coerce")
+        qtd = 0.0 if pd.isna(qtd_num) else float(qtd_num)
+        meses = 1.0 if pd.isna(meses_num) or float(meses_num) <= 0 else float(meses_num)
 
         if grupo == "Bolsas":
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Implementação de bolsas", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de contrato de bolsas", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de bolsa", qtd * meses, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de pagamentos de bolsas", meses, fator_icp, fator_giro, fator_complexidade)
+            # Uma vez por bolsista.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Implementação de bolsas", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de contrato de bolsas", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            # Uma ocorrência por bolsista em cada mês de bolsa; meses já entram na quantidade total.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de bolsa", qtd * meses, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
+            # Uma rotina por mês, independentemente da quantidade de bolsistas.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de pagamentos de bolsas", 1, fator_icp, fator_giro, fator_complexidade, "mensal", meses)
 
         elif grupo == "Celetistas":
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Seleção de CLT", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Contratação CLT", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão mensal de contratos (por pessoa)", qtd * meses, fator_icp, fator_giro, fator_complexidade)
+            # Seleção e contratação são eventos únicos por pessoa.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Seleção de CLT", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Contratação CLT", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            # Gestão mensal por celetista durante os meses informados.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão mensal de contratos (por pessoa)", qtd, fator_icp, fator_giro, fator_complexidade, "mensal", meses)
 
         elif grupo == "RPA":
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Seleção de RPA (Projetos)", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de Contratos RPA (Projetos)", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de RPA", qtd, fator_icp, fator_giro, fator_complexidade)
+            # Cada RPA representa uma ocorrência completa; não há nova multiplicação pela vigência.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Seleção de RPA (Projetos)", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de Contratos RPA (Projetos)", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de RPA", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
 
         elif grupo in ["Material de consumo", "Material permanente", "Serviço PJ"]:
             if "Inexigibilidade" in modalidade_contratacao:
@@ -1257,42 +1376,75 @@ def gerar_memoria_doa(df_parf_atual, bases):
             else:
                 atividade_compra = "Compra direta"
 
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade_compra, qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de fornecedor", qtd, fator_icp, fator_giro, fator_complexidade)
+            # Processo de contratação e pagamento são contados pela quantidade informada.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, atividade_compra, qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de fornecedor", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
 
             if grupo == "Material permanente":
-                adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de patrimônio", qtd, fator_icp, fator_giro, fator_complexidade)
+                adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de patrimônio", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+
             if grupo == "Serviço PJ":
-                adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gestão de contratos de compras e contratações", qtd, fator_icp, fator_giro, fator_complexidade)
+                # Gestão contratual mensal durante a vigência do projeto.
+                adicionar_linha_doa(
+                    linhas, tempo_df, custo_hora_df,
+                    "Gestão de contratos de compras e contratações",
+                    qtd, fator_icp, fator_giro, fator_complexidade,
+                    "mensal", vigencia_projeto
+                )
 
         elif grupo == "Importação":
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Importação", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de fornecedor", qtd, fator_icp, fator_giro, fator_complexidade)
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Importação", qtd, fator_icp, fator_giro, fator_complexidade, "pontual")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de fornecedor", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
 
         elif grupo == "Passagens":
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Número de passagens", qtd, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de fornecedor", qtd, fator_icp, fator_giro, fator_complexidade)
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Número de passagens", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de fornecedor", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
 
         elif grupo == "Diárias":
-            quantidade_operacional = qtd * meses
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Diárias (Projetos)", quantidade_operacional, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de diária", quantidade_operacional, fator_icp, fator_giro, fator_complexidade)
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Diárias (Projetos)", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Pagamento de diária", qtd, fator_icp, fator_giro, fator_complexidade, "ocorrencia")
 
         elif grupo == "Tarifas bancárias":
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Conciliação bancária", 1, fator_icp, fator_giro, fator_complexidade)
+            # Conciliação é uma rotina mensal do projeto.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Conciliação bancária", 1, fator_icp, fator_giro, fator_complexidade, "mensal", vigencia_projeto)
 
         elif grupo in ["Ressarcimento", "Contrapartida"]:
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gerenciamento orçamentário e financeiro (Projetos)", 1, fator_icp, fator_giro, fator_complexidade)
-            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Entrada de receita (notas)", 1, fator_icp, fator_giro, fator_complexidade)
+            # A entrada da receita é pontual; o gerenciamento financeiro é mensal.
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Gerenciamento orçamentário e financeiro (Projetos)", 1, fator_icp, fator_giro, fator_complexidade, "mensal", vigencia_projeto)
+            adicionar_linha_doa(linhas, tempo_df, custo_hora_df, "Entrada de receita (notas)", 1, fator_icp, fator_giro, fator_complexidade, "pontual")
 
         elif grupo == "Prospecção":
+            # Uma atividade pontual de articulação institucional.
             adicionar_linha_doa(
                 linhas, tempo_df, custo_hora_df, "Comunicação institucional", 1,
                 fator_icp, fator_giro, fator_complexidade,
+                "pontual", 1,
                 componente_forcado="Prospecção e articulação institucional"
             )
 
     memoria = pd.DataFrame(linhas)
+
+    # Consolida atividades idênticas para evitar linhas repetidas na memória de cálculo.
+    if not memoria.empty:
+        chaves = [
+            "componente", "setor", "atividade", "tempo_base_h", "vigencia_meses",
+            "custo_hora_pessoal", "custo_hora_adm", "custo_hora_total",
+            "fator_icp", "fator_giro", "fator_complexidade"
+        ]
+        memoria = memoria.groupby(chaves, as_index=False, dropna=False).agg({
+            "quantidade_operacional": "sum",
+            "horas_estimadas": "sum",
+            "valor_calculado": "sum",
+        })
+
+        ordem = [
+            "componente", "setor", "atividade", "quantidade_operacional",
+            "tempo_base_h", "vigencia_meses", "horas_estimadas",
+            "custo_hora_pessoal", "custo_hora_adm", "custo_hora_total",
+            "fator_icp", "fator_giro", "fator_complexidade", "valor_calculado"
+        ]
+        memoria = memoria[ordem]
+
     return memoria, custo_hora_df, media_icp, media_giro, fator_icp, fator_giro, fator_complexidade
 
 
@@ -1506,9 +1658,9 @@ def obter_resumo_doa_proposta(df_parf_atual):
 
     resumo = memoria.groupby("componente", as_index=False)["valor_calculado"].sum()
     total_calculado = float(resumo["valor_calculado"].sum())
-    limite_legal = valor_projeto * 0.15
-    fator_limitador = min(1, limite_legal / total_calculado) if total_calculado > 0 else 1
-    resumo["valor_ajustado"] = resumo["valor_calculado"] * fator_limitador
+    prazo_meses = float(projeto.get("prazo_meses", 1) or 1)
+    ajustes = calcular_ajustes_metodologicos_doa(total_calculado, valor_projeto, prazo_meses)
+    resumo["valor_ajustado"] = resumo["valor_calculado"] * ajustes["fator_ajuste_final"]
 
     resumo = resumo.rename(columns={
         "componente": "Componente da DOA",
@@ -2681,23 +2833,34 @@ elif pagina == "4. DOA":
 
     total_calculado = float(resumo_componentes["valor_calculado"].sum())
     total_parf_execucao = float(pd.to_numeric(df_parf_atual["total"], errors="coerce").fillna(0).sum())
-    limite_legal = valor_projeto * 0.15
-    fator_limitador = min(1, limite_legal / total_calculado) if total_calculado > 0 else 1
-    total_ajustado = total_calculado * fator_limitador
-    percentual_calculado = total_calculado / total_parf_execucao if total_parf_execucao else 0
-    deficit_operacional = max(0, total_calculado - limite_legal)
+    prazo_meses = float(projeto.get("prazo_meses", 1) or 1)
+    ajustes_doa = calcular_ajustes_metodologicos_doa(total_calculado, valor_projeto, prazo_meses)
+
+    fator_limitador = ajustes_doa["fator_ajuste_final"]
+    total_ajustado = ajustes_doa["doa_final"]
+    limite_legal = ajustes_doa["limite_legal"]
+    percentual_calculado = ajustes_doa["percentual_final"]
+    deficit_operacional = ajustes_doa["deficit_operacional"]
 
     resumo_componentes["valor_ajustado"] = resumo_componentes["valor_calculado"] * fator_limitador
+
+    st.info(
+        "Metodologia: as atividades pontuais e por ocorrência não são multiplicadas pela vigência; "
+        "os meses são aplicados apenas às rotinas mensais. Sobre a DOA operacional são aplicados, "
+        "automaticamente, um fator amortecido de sustentação temporal e um fator de governança "
+        "associado ao porte financeiro do projeto. A DOA final respeita piso institucional de 5% "
+        "e teto legal de 15% do valor aprovado/previsto."
+    )
 
     st.markdown("### Resultado da DOA")
 
     card_cols = st.columns(5)
     cards = [
-        ("DOA calculada", moeda(total_calculado)),
-        ("Percentual calculado", f"{percentual_calculado:.2%}".replace(".", ",")),
-        ("Limite legal", moeda(limite_legal)),
-        ("DOA real", moeda(total_ajustado)),
-        ("Déficit operacional", moeda(deficit_operacional)),
+        ("DOA operacional", moeda(total_calculado)),
+        ("DOA metodológica", moeda(ajustes_doa["doa_metodologica"])),
+        ("Piso institucional (5%)", moeda(ajustes_doa["piso_institucional"])),
+        ("DOA final", moeda(total_ajustado)),
+        ("Percentual final", f"{percentual_calculado:.2%}".replace(".", ",")),
     ]
     for col, (label, valor) in zip(card_cols, cards):
         with col:
@@ -2709,6 +2872,22 @@ elif pagina == "4. DOA":
                 </div>
                 """,
                 unsafe_allow_html=True
+            )
+
+    with st.expander("Ver parâmetros automáticos da metodologia"):
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            st.metric("Vigência equivalente", f"{ajustes_doa['anos_vigencia']:.2f} anos".replace(".", ","))
+        with col_m2:
+            st.metric("Fator temporal", f"{ajustes_doa['fator_temporal']:.2f}".replace(".", ","))
+        with col_m3:
+            st.metric("Fator de governança", f"{ajustes_doa['fator_governanca']:.2f}".replace(".", ","))
+        with col_m4:
+            st.metric("Limite legal (15%)", moeda(ajustes_doa["limite_legal"]))
+        if deficit_operacional > 0:
+            st.warning(
+                "A necessidade metodológica ultrapassou o teto legal. "
+                f"Déficit operacional não coberto: {moeda(deficit_operacional)}."
             )
 
     st.markdown("### Fatores ICP e Giro aplicados")
@@ -2737,9 +2916,9 @@ elif pagina == "4. DOA":
     resumo_visual = resumo_tabela.rename(columns={
         "componente": "Componente da DOA",
         "valor_calculado": "Valor calculado",
-        "valor_ajustado": "Valor ajustado pelo limite"
+        "valor_ajustado": "Valor final da DOA"
     })
-    resumo_visual = formatar_tabela_moeda(resumo_visual, ["Valor calculado", "Valor ajustado pelo limite"])
+    resumo_visual = formatar_tabela_moeda(resumo_visual, ["Valor calculado", "Valor final da DOA"])
 
     st.dataframe(resumo_visual, use_container_width=True, hide_index=True)
 
@@ -2750,7 +2929,7 @@ elif pagina == "4. DOA":
             "atividade": "Atividade",
             "quantidade_operacional": "Quantidade operacional",
             "tempo_base_h": "Tempo base (h)",
-            "vigencia_meses": "Vigência considerada (meses)",
+            "vigencia_meses": "Meses aplicáveis",
             "horas_estimadas": "Horas estimadas",
             "custo_hora_pessoal": "Custo hora pessoal",
             "custo_hora_adm": "Custo hora administrativo",

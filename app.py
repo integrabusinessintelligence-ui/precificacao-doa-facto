@@ -332,8 +332,43 @@ def parse_data_streamlit(valor, padrao=None):
 
 
 def selectbox_obrigatorio(label, opcoes, key=None, texto_vazio="Selecione..."):
+    """Lista suspensa pesquisável, sem dependência externa.
+
+    O usuário digita parte do texto e a lista é filtrada dinamicamente.
+    Esta função deve ser usada fora de st.form para que a busca atualize
+    imediatamente a cada digitação.
+    """
     opcoes_limpas = limpar_lista(opcoes)
-    valor = st.selectbox(label, [texto_vazio] + opcoes_limpas, index=0, key=key)
+    chave_base = key or nome_seguro_arquivo(label)
+
+    termo = st.text_input(
+        f"Buscar em {label.lower()}",
+        value="",
+        placeholder="Digite parte do texto para filtrar...",
+        key=f"{chave_base}_busca"
+    ).strip()
+
+    if termo:
+        termo_norm = termo.casefold()
+        opcoes_filtradas = [
+            opcao for opcao in opcoes_limpas
+            if termo_norm in str(opcao).casefold()
+        ]
+    else:
+        opcoes_filtradas = opcoes_limpas
+
+    if termo and not opcoes_filtradas:
+        st.caption("Nenhuma opção encontrada para a busca informada.")
+
+    # A chave da seleção varia conforme o termo, evitando que o Streamlit
+    # retenha uma opção que deixou de existir após a filtragem.
+    termo_chave = nome_seguro_arquivo(termo) if termo else "todos"
+    valor = st.selectbox(
+        label,
+        [texto_vazio] + opcoes_filtradas,
+        index=0,
+        key=f"{chave_base}_selecao_{termo_chave}"
+    )
     return "" if valor == texto_vazio else valor
 
 
@@ -927,6 +962,52 @@ def criar_nova_versao(id_projeto, versao_origem):
 
     return nova_versao
 
+
+
+def excluir_proposta_versao(id_projeto, versao):
+    """Exclui uma versão da proposta e todos os registros vinculados.
+
+    A exclusão abrange cadastro, PARF, ICP/Giro, DOA e arquivos DOCX gerados
+    para a mesma combinação de ID e versão.
+    """
+    id_txt = str(id_projeto)
+    versao_int = int(versao)
+    removidos = {}
+
+    estruturas = [
+        (ARQ_PROJETOS, colunas_projetos(), "projetos"),
+        (ARQ_PARF, colunas_parf(), "parf"),
+        (ARQ_ICP_GIRO, colunas_icp_giro(), "icp_giro"),
+        (ARQ_DOA, colunas_doa(), "doa"),
+    ]
+
+    for arquivo, colunas, nome in estruturas:
+        df = carregar_excel(arquivo, colunas)
+        if df.empty or "id_projeto" not in df.columns or "versao" not in df.columns:
+            removidos[nome] = 0
+            continue
+
+        versoes = pd.to_numeric(df["versao"], errors="coerce")
+        filtro = (df["id_projeto"].astype(str) == id_txt) & (versoes == versao_int)
+        removidos[nome] = int(filtro.sum())
+        df_final = df.loc[~filtro].copy()
+
+        for coluna in colunas:
+            if coluna not in df_final.columns:
+                df_final[coluna] = None
+        salvar_excel(df_final[colunas], arquivo)
+
+    removidos["documentos"] = 0
+    if SAIDAS_DIR.exists():
+        padrao = f"*_v{versao_int}_{id_txt}.docx"
+        for arquivo_docx in SAIDAS_DIR.glob(padrao):
+            try:
+                arquivo_docx.unlink()
+                removidos["documentos"] += 1
+            except OSError:
+                pass
+
+    return removidos
 
 
 # =========================
@@ -1939,6 +2020,35 @@ else:
                 st.sidebar.success(f"Versão {nova} criada.")
                 st.rerun()
 
+        st.sidebar.markdown("---")
+        confirmar_exclusao = st.sidebar.checkbox(
+            "Confirmo a exclusão desta versão",
+            value=False,
+            key=f"confirmar_exclusao_{linha['id_projeto']}_{linha['versao']}"
+        )
+        excluir_btn = st.sidebar.button(
+            "🗑️ Excluir esta versão da proposta",
+            use_container_width=True,
+            disabled=not confirmar_exclusao,
+            key=f"excluir_proposta_{linha['id_projeto']}_{linha['versao']}"
+        )
+
+        if excluir_btn:
+            id_excluir = str(linha["id_projeto"])
+            versao_excluir = int(linha["versao"])
+            excluir_proposta_versao(id_excluir, versao_excluir)
+
+            if (
+                str(st.session_state.get("id_projeto", "")) == id_excluir
+                and int(st.session_state.get("versao", 0) or 0) == versao_excluir
+            ):
+                st.session_state.pop("id_projeto", None)
+                st.session_state.pop("versao", None)
+                st.session_state.pop("status", None)
+
+            st.sidebar.success("Versão da proposta excluída com sucesso.")
+            st.rerun()
+
 pagina = st.sidebar.radio(
     "Etapas",
     [
@@ -2124,7 +2234,7 @@ elif pagina == "2. PARF":
     valor_adicional = 0.0
     modalidade_contratacao = ""
 
-    with st.form(f"form_parf_item_{form_seq}"):
+    with st.container(border=True):
         col1, col2, col3 = st.columns(3)
 
         with col1:
@@ -2447,7 +2557,7 @@ elif pagina == "2. PARF":
         if modalidade_contratacao:
             st.markdown(f"**Modalidade estimada:** {modalidade_contratacao}")
 
-        salvar_item = st.form_submit_button("Adicionar item ao PARF")
+        salvar_item = st.button("Adicionar item ao PARF", type="primary", key=f"salvar_item_parf_{form_seq}")
 
     if salvar_item:
         if grupo in ["Ressarcimento", "Contrapartida", "Prospecção"] and valor_unitario <= 0:
